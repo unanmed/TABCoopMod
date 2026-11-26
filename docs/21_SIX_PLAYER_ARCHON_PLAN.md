@@ -322,8 +322,9 @@ public static class CoopLimits
 
 ### 已完成（2026-11-26）
 
-- **版本标识**
-  - `ModInfo.Version` 改为 `0.2.8-6p`，`AssemblyVersion` 保持 `0.2.8.0`；避免与官方 0.2.8 混连。
+- **版本标识与上游同步**
+  - 已同步上游 `v0.2.9`（确定性迷雾/感知同步、隐形僵尸与重同步循环修复、多阵营账本修复）。
+  - `ModInfo.Version` 改为 `0.2.9-6p`，`AssemblyVersion` 为 `0.2.9.0`；避免与官方 0.2.9 混连。
 - **Phase A**
   - 新增 `Core/CoopLimits.cs`：`MaxPlayers = 6`、`MaxFactionPlayers = 3`、6 色玩家调色板。
   - 传输层默认值与 `StartHostSession` 改为 `CoopLimits.MaxPlayers`。
