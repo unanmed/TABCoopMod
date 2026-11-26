@@ -42,9 +42,9 @@
 ### 1.1 启动带控制通道的游戏
 
 ```powershell
-# 自动读档进入关卡（推荐）
+# 自动读档进入关卡（推荐；运行生存档前先做好 Saves 目录外原名备份）
 powershell -ExecutionPolicy Bypass -File scripts/run_game_with_control.ps1 `
-    -SavePath "$env:USERPROFILE\Documents\My Games\They Are Billions\Saves\6666.zxsav"
+    -SavePath "$env:USERPROFILE\Documents\My Games\They Are Billions\Saves\bench_900_archon2p.zxsav"
 
 # 手动进游戏后再开控制通道
 powershell -ExecutionPolicy Bypass -File scripts/run_game_with_control.ps1 -NoAutoLoad
@@ -86,6 +86,12 @@ powershell -ExecutionPolicy Bypass -File scripts/control_smoke.ps1 -Port 27901
 
 ## 3. 自动化确定性回放与双端联机脚本
 
+> [!CAUTION]
+> **测试前强制备份生存存档（禁止裸跑原档）**：
+> - 《They Are Billions》生存模式在战败或触发清理时（`ZXGame.#=zvpunKuk5xh_4xlTRbw==`）会调用 `File.Delete` **绕过回收站**连带删除 `<name>.zxsav`、`<name>_Backup.zxsav`、`<name>_Crash.zxsav` 及对应 `.zxcheck`，Steam Cloud 会随即执行 `Forget OK` 抹除云端副本（在开启 TRIM 的 SSD 上也极难恢复）。
+> - 且 `.zxcheck` 校验与 `.zxsav` **原文件名绑定**，直接改名复制到 `Saves\` 内（如重命名为 `cooptest_*.zxsav`）会导致 `ReadSaveFile` 抛出 `NullReferenceException` 加载失败。
+> - **规范做法**：在执行 `run_chaos_two_instance.ps1`、`run_game_with_control.ps1` 或任何可能推进局内时间/触发战败的测试前，**必须先将目标存档组（主档 + `_Backup` + `_Crash` + `.zxcheck`）以原文件名备份到 `Saves\` 目录外**（如 `D:\TAB_Saves_Backup\`），测试结束后或发现缺失时立即原名写回。
+
 ### 3.1 双进程确定性回放验证（Gate A）
 ```powershell
 # 战役档 120 tick 验证
@@ -94,7 +100,7 @@ powershell -ExecutionPolicy Bypass -File scripts/run_replay_verify.ps1 `
 
 # 生存大档 180 tick 验证（可选 -ShotCam "cx,cy,w,h" 与 -RevealMap 采集可视化截图）
 powershell -ExecutionPolicy Bypass -File scripts/run_replay_verify.ps1 `
-    -SavePath "$env:USERPROFILE\Documents\My Games\They Are Billions\Saves\6666.zxsav" -Ticks 180
+    -SavePath "$env:USERPROFILE\Documents\My Games\They Are Billions\Saves\bench_900_archon2p.zxsav" -Ticks 180
 ```
 - 辅助对比脚本：
   - `scripts/compare_hashes.ps1`：逐 tick 比对 `coop_replay_run1/2.timeline` 的 `hash/entities/pos/life/proj/prod/resv`。
@@ -105,7 +111,7 @@ powershell -ExecutionPolicy Bypass -File scripts/run_replay_verify.ps1 `
 ```powershell
 # 洁净回环 65s 同步验证
 powershell -ExecutionPolicy Bypass -File scripts/run_chaos_two_instance.ps1 `
-    -SavePath "$env:USERPROFILE\Documents\My Games\They Are Billions\Saves\6666.zxsav" `
+    -SavePath "$env:USERPROFILE\Documents\My Games\They Are Billions\Saves\bench_900_archon2p.zxsav" `
     -Chaos "" -TimeoutSeconds 90 -HoldSeconds 65
 
 # 带延迟 / 抖动 / 丢包 / 断连的故障注入压测
@@ -115,7 +121,7 @@ powershell -ExecutionPolicy Bypass -File scripts/run_chaos_two_instance.ps1 `
 
 # 异构算力 / 帧率不对称双开压测（例如模拟主机 30Hz vs 客机 ~20Hz）
 powershell -ExecutionPolicy Bypass -File scripts/run_chaos_two_instance.ps1 `
-    -SavePath "$env:USERPROFILE\Documents\My Games\They Are Billions\Saves\6666.zxsav" `
+    -SavePath "$env:USERPROFILE\Documents\My Games\They Are Billions\Saves\bench_900_archon2p.zxsav" `
     -Chaos "" -ClientExtraTickMs 30 -TimeoutSeconds 120 -HoldSeconds 60
 ```
 - 日志自动分离为 `<游戏目录>\TABCoopMod.host.log` 与 `TABCoopMod.client.log`（日常非 `TABCOOP_LOG_NAME` 启动会自动归档至 `TABCoopMod_Logs/`）。
@@ -128,12 +134,16 @@ powershell -ExecutionPolicy Bypass -File scripts/run_chaos_two_instance.ps1 `
 
 ## 4. 本机实测测试存档清单
 
-| 存档 | 模式 | 基准 Tick | 总实体 / 玩家实体 | 适用测试场景 |
+> 说明：`6666.zxsav` / `6666_Backup.zxsav`（及 `900survival.zxsav`）此前用于早期门禁，其中 `6666*` 已于 2026-11-26 因生存模式战败删档机制从本地与云端清除；下方列出当前 `Saves\` 目录实存可用存档，使用任何生存档做推进/战斗测试前均须先做目录外备份。
+
+| 存档 | 模式 | 基准 Tick | 规模特征 | 适用测试场景 |
 | :--- | :--- | ---: | :--- | :--- |
 | `1_Backup.zxsav` | **Campaign** (Normal) | 31904 | ~9.8k / 178 | 快速回放回归、暂停/建造/单位移动控制测试 |
-| `6666.zxsav` | **Survival** | 168485 | ~33.5k / 1020 | **推荐默认测试档**：中后期生存完整压力面（建筑/产兵/尸潮/多线） |
+| `1_Crash.zxsav` | **Survival** | ~34.8k | 中期 16 分钟档 | 中期战斗、独立相机与单位指令联调 |
+| `bench_900_archon2p.zxsav` | **Survival** | 1 | 900% 2P 执政官基准 | 双进程回放、联机同步与性能基准测试 |
+| `Survival.zxsav` | **Survival** | 35648 | 85,234 实体 | 大体量后期生存负载与异构算力测试（**极易战败删档，测试前必备份**） |
+| `Panorama_VO_202693_Crash.zxsav` | **Survival** | 3 | 111,723 实体 | 极端实体数与全图压力测试 |
 | `test.zxsav` | **Survival** | 443 | ~43k / 6 | 早期生存探索期 |
-| `900survival.zxsav` | **Survival** | 11 | ~39.7k / 6 | 极早期开局状态 |
 
 ---
 

@@ -45,3 +45,6 @@ coop_cam_*.json
 # Local notes & video showcase workspace
 .notes/
 video_showcase/
+
+#考虑适配的其他mod参考
+referencemod/

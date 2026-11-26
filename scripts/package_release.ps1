@@ -16,8 +16,8 @@ if ([string]::IsNullOrWhiteSpace($WorkspaceDir)) {
 
 # Keep the zip name / config version in sync with ModInfo.cs unless -Version is passed explicitly.
 $modInfoPath = Join-Path $WorkspaceDir "src\TABCoopMod\Core\ModInfo.cs"
-$asmVersion = "0.2.8.0"
-$modVersion = "0.2.8-6p"
+$asmVersion = "0.2.9.0"
+$modVersion = "0.2.9-6p"
 if (Test-Path $modInfoPath) {
     $modInfoText = Get-Content $modInfoPath -Raw
     $mv = [regex]::Match($modInfoText, 'Version\s*=\s*"([^"]+)"')

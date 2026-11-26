@@ -230,6 +230,10 @@ namespace TABCoopMod.Core
 
         // 14. Phase 4 M2 & M3 Multi-Faction Economy, Tech, Wonders & Visuals
         public static Type TypeTechnology { get; private set; }
+        public static Type TypeCInvisibleWhenNotWatched { get; private set; }
+        private static MethodInfo _methodCInvisibleUpdateOpacity;
+        private static PropertyInfo _propLevelExtHideEnemies;
+        private static MethodInfo _methodLevelExtGetCurrent;
         public static Type TypeUndoBuilding { get; private set; }
         public static Type TypeDestroy { get; private set; }
         public static Type TypeCResourceGenerator { get; private set; }
@@ -692,6 +696,8 @@ namespace TABCoopMod.Core
                 {
                     _propLevelExtMapDrawer = AccessTools.Property(_typeZXLevelExtension, "MapDrawer");
                     _propLevelExtLevelEvents = AccessTools.Property(_typeZXLevelExtension, "LevelEvents");
+                    _propLevelExtHideEnemies = AccessTools.Property(_typeZXLevelExtension, "HideEnemiesIfNotWatched");
+                    _methodLevelExtGetCurrent = AccessTools.Method(_typeZXLevelExtension, "#=zuartwoo=", Type.EmptyTypes);
                 }
                 if (_typeZXMapDrawer != null)
                 {
@@ -805,6 +811,10 @@ namespace TABCoopMod.Core
                 TypeCLife = GameAssembly.GetType(ObfuscatedSymbols.Type_CLife);
                 TypeTrain = GameAssembly.GetType(ObfuscatedSymbols.Type_Train);
                 TypeUpgrade = GameAssembly.GetType(ObfuscatedSymbols.Type_Upgrade);
+                TypeCInvisibleWhenNotWatched = GameAssembly.GetType(ObfuscatedSymbols.Type_CInvisibleWhenNotWatched);
+                _methodCInvisibleUpdateOpacity = TypeCInvisibleWhenNotWatched != null
+                    ? AccessTools.Method(TypeCInvisibleWhenNotWatched, ObfuscatedSymbols.Method_CInvisibleWhenNotWatched_UpdateOpacity, Type.EmptyTypes)
+                    : null;
                 _fieldLevelSysCurrentCC = TypeZXSystemGameLevel != null
                     ? AccessTools.Field(TypeZXSystemGameLevel, ObfuscatedSymbols.Field_LevelSys_CurrentCC)
                     : null;
@@ -1027,6 +1037,10 @@ namespace TABCoopMod.Core
                 Check(_typeZXLevelExtension, "Type ZXLevelExtension");
                 Check(_propLevelExtMapDrawer, "ZXLevelExtension.MapDrawer");
                 Check(_propLevelExtLevelEvents, "ZXLevelExtension.LevelEvents");
+                Check(_propLevelExtHideEnemies, "ZXLevelExtension.HideEnemiesIfNotWatched");
+                Check(_methodLevelExtGetCurrent, "ZXLevelExtension.Current");
+                Check(TypeCInvisibleWhenNotWatched, "Type CInvisibleWhenNotWatched");
+                Check(_methodCInvisibleUpdateOpacity, "CInvisibleWhenNotWatched.UpdateOpacity");
                 Check(_typeZXMapDrawer, "Type ZXMapDrawer");
                 Check(_propMapDrawerExtraEntities, "ZXMapDrawer.ExtraEntities");
                 Check(_propMapDrawerLayerTerrain, "ZXMapDrawer.LayerTerrain");
@@ -4055,15 +4069,26 @@ namespace TABCoopMod.Core
 
                 if (ent.SceneObject != null)
                 {
-                    ent.SceneObject.Opacity = 0f;
-                    // Zombies carry CInvisibleWhenNotWatched which handles fog-gated fade-in (+0.09 / 4 ticks);
-                    // player units need an explicit short visual fade-in clip.
-                    if (!IsZombieType(ent.GetType()) && ent.SceneObject.Animation != null)
+                    bool isZombie = IsZombieType(ent.GetType());
+                    bool hasFogGateComp = isZombie && HasComponentOfType(ent, TypeCInvisibleWhenNotWatched) && IsHideEnemiesIfNotWatched();
+                    if (hasFogGateComp)
                     {
-                        DXClip clip = ent.SceneObject.Animation.NewClip();
-                        DXTransition tr = clip.NewTransition(350, -1f);
-                        tr.RangeOpacity = new DXRange<float?>(0f, 1f);
-                        clip.OnFinished += delegate { try { clip.Clear(); } catch { } };
+                        RefreshEntityFogVisibility(ent);
+                    }
+                    else
+                    {
+                        ent.SceneObject.Opacity = 0f;
+                        if (ent.SceneObject.Animation != null)
+                        {
+                            DXClip clip = ent.SceneObject.Animation.NewClip();
+                            DXTransition tr = clip.NewTransition(isZombie ? 200 : 350, -1f);
+                            tr.RangeOpacity = new DXRange<float?>(0f, 1f);
+                            clip.OnFinished += delegate { try { clip.Clear(); } catch { } };
+                        }
+                        else
+                        {
+                            ent.SceneObject.Opacity = 1f;
+                        }
                     }
                 }
 
@@ -4078,6 +4103,65 @@ namespace TABCoopMod.Core
             {
                 Determinism.LockstepClock.ExitVisualVfxContext();
             }
+        }
+
+        private static bool HasComponentOfType(DXEntity entity, Type componentType)
+        {
+            if (entity == null || componentType == null || entity.Components == null)
+                return false;
+            for (int i = 0; i < entity.Components.Count; i++)
+            {
+                var c = entity.Components[i];
+                if (c != null && componentType.IsInstanceOfType(c))
+                    return true;
+            }
+            return false;
+        }
+
+        public static bool IsHideEnemiesIfNotWatched()
+        {
+            try
+            {
+                object ext = DXLevel.Current?.Extension ?? _methodLevelExtGetCurrent?.Invoke(null, null);
+                if (ext != null && _propLevelExtHideEnemies != null)
+                    return (bool)_propLevelExtHideEnemies.GetValue(ext);
+            }
+            catch { }
+            return true;
+        }
+
+        /// <summary>
+        /// Updates fog-gated visibility immediately on spawned/teleported zombies so enemies inside
+        /// currently watched vision appear at full opacity instead of starting or sticking at 0f.
+        /// </summary>
+        public static void RefreshEntityFogVisibility(DXEntity entity)
+        {
+            if (entity == null || entity.Disposed || entity.SceneObject == null)
+                return;
+
+            try
+            {
+                bool hideIfNotWatched = IsHideEnemiesIfNotWatched();
+                if (hideIfNotWatched && TypeCInvisibleWhenNotWatched != null && _methodCInvisibleUpdateOpacity != null && entity.Components != null)
+                {
+                    for (int i = 0; i < entity.Components.Count; i++)
+                    {
+                        var comp = entity.Components[i];
+                        if (comp != null && TypeCInvisibleWhenNotWatched.IsInstanceOfType(comp))
+                        {
+                            _methodCInvisibleUpdateOpacity.Invoke(comp, null);
+                            return;
+                        }
+                    }
+                }
+
+                if (!hideIfNotWatched && entity.SceneObject.Opacity < 0.01f)
+                {
+                    entity.SceneObject.Opacity = 1f;
+                    entity.SceneObject.Visible = true;
+                }
+            }
+            catch { }
         }
 
         public static void FlushStartFramePostMethods()

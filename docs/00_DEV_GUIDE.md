@@ -24,7 +24,7 @@
 | :--- | :--- | :--- |
 | **操作系统 / Shell** | Windows 11 x64，PowerShell | 命令行脚本优先使用 PowerShell 语法（如 `Select-String`、`Stop-Process`、`Get-Content -Tail 50 -Wait`）。 |
 | **.NET SDK** | `.NET SDK 10.0.100` | Mod 主工程目标框架 `net46` / `x64`（`<AllowUnsafeBlocks>true</AllowUnsafeBlocks>`）；MCP 服务端为 `net10.0`。 |
-| **游戏存档目录** | `%USERPROFILE%\Documents\My Games\They Are Billions\Saves` | 存档由 `.zxsav`（加密 ZIP）+ `.zxcheck`（校验文本，与 `.zxsav` 文件名绑定）成对组成。 |
+| **游戏存档目录** | `%USERPROFILE%\Documents\My Games\They Are Billions\Saves` | 存档由 `.zxsav`（加密 ZIP）+ `.zxcheck`（校验文本，与 `.zxsav` 文件名绑定，改名拷贝会导致 `ReadSaveFile` 报错无法加载）成对组成。**生存模式测试前必须将主档、`_Backup`、`_Crash` 及对应 `.zxcheck` 原名备份到 `Saves\` 目录外**（详见 §4 坑点）。 |
 | **Mod 运行日志** | `<游戏目录>\TABCoopMod.log` 与 `TABCoopMod_Logs\` | `ModLogger` 路径基于 `typeof(ModLogger).Assembly.Location`；正常启动会自动在 `TABCoopMod_Logs/` 按版本号+时间戳归档（最多保留 30 份）；多开可通过环境变量 `TABCOOP_LOG_NAME` 分离日志。 |
 | **依赖库说明** | `lib/`（由 `extract_sdk.ps1` 导出） | `TABCoopMod.csproj` 统一从 `lib/` 引用游戏与引擎程序集（`<Private>False</Private>`，不复制到游戏目录）；运行构建前请先执行 `scripts/extract_sdk.ps1`。 |
 
@@ -91,6 +91,7 @@ powershell -ExecutionPolicy Bypass -File scripts/decompile_type.ps1 -AssemblyPat
 | **RyuJIT 内联短静态方法** | `ZXGame.#=zB3Vhdin5PerfrubjO4AblAA=()`（`IsMultiplayer`）仅 6~8 字节 IL，会被 x64 JIT 内联而绕过 Harmony Prefix | 直接在底层引擎接口（如 `DXWorldGrid.FindPathConcurrent`）实施拦截（`DeterministicPathfindingPatch`）。 |
 | **混淆名标识符 `CS1040`** | 直接在 C# 中写 `#=z...` 会被当作预处理指令编译失败 | 全部混淆常量统一收敛至 `ObfuscatedSymbols.cs`，业务层通过 `GameBridge` 桥接调用。 |
 | **直接运行 EXE 秒退** | `SteamAPI.RestartAppIfNecessary` 拉起 Steam 并杀掉当前进程 | `install_mod.ps1` 自动在游戏目录写 `steam_appid.txt`（内容 `644930`）。 |
+| **生存存档测试后整套消失** | 用生存原档跑长时联机/战斗脚本一旦战败，主档、`_Backup`、`_Crash` 及 `.zxcheck` 全部被清空且云端同步抹除；改名拷贝进 `Saves\` 则无法加载 | 引擎铁人删档逻辑（`ZXGame.#=zvpunKuk5xh_4xlTRbw==`）会调用 `File.Delete`（绕过回收站）连删 6 个相关文件，Steam Cloud 随即 `Forget OK`，且 SSD TRIM 会快速清零释放簇；同时 `.zxcheck` 绑定原文件名，改名即报错。**测试前必须以原文件名将完整存档组备份至 `Saves\` 目录外（如 `D:\TAB_Saves_Backup\`）**，测试战败或结束后按原名还原，禁止裸跑用户生存原档。 |
 
 ---
 

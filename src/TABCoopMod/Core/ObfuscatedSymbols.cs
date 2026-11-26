@@ -427,5 +427,19 @@ namespace TABCoopMod.Core
         public const string Type_ZombieWeakA                       = "ZX.Entities.ZombieWeakA";
         public const string Type_ZombieMediumA                     = "ZX.Entities.ZombieMediumA";
         public const string Type_ZombieWorkerA                     = "ZX.Entities.ZombieWorkerA";
+
+        // ====================================================================
+        // 22. Deterministic Fog-of-War & Watcher Cadence Isolation
+        // ====================================================================
+        public const string Method_ZXBehaviour_WatchIntervalGate   = "#=z5O$3wVJdMoVTAfFU1A==";
+        public const string Type_CMapWatcher                       = "ZX.Components.CMapWatcher";
+        public const string Field_CMapWatcher_WatchRange           = "#=z5A00j9MXV3op";
+        public const string Type_CInvisibleWhenNotWatched          = "ZX.Components.CInvisibleWhenNotWatched";
+        public const string Method_CInvisibleWhenNotWatched_UpdateOpacity = "#=zeSvSmIE=";
+        public const string Field_MapLayers_FogEnabled             = "#=zAWAnTYtmVWSWf5QWuplIscs=";
+        public const string Method_MapLayers_RevealCellRadius      = "#=z$YIzGtguLyaT";
+        public const string Method_MapLayers_IsExploredPoint       = "#=zm1sFXg4ILBZxoivUvA==";
+        public const string Method_MapLayers_IsWatchedPoint        = "#=z4SfTR0oOSoLp";
+        public const string Method_MapLayers_IsNearExplored        = "#=zdnaioeiQZgd6TvCsa2ua8_w=";
     }
 }

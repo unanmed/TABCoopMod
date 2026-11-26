@@ -123,9 +123,9 @@ namespace TABCoopMod.Sync
         private const int EconReloadStreak = 3;              // ~6s persistent time/unhandled econ mismatch
         private const int AsyncEconFallbackStreak = 6;       // ~12s fallback if async econ/prod/resv fails to converge
         private const int StructuralReloadStreak = 6;        // ~12s entity-count delta beyond tolerance
-        private const int MissingOnClientReloadStreak = 4;   // ~8s sustained unspawned/missing Host entities on Client
+        private const int MissingOnClientReloadStreak = 6;   // ~12s sustained unspawned/missing Host entities on Client
         private const int WidePosReloadStreak = 10;          // ~15-20s wide residual drift after corrections
-        private const double StructuralResyncCooldownMs = 30000.0;
+        private const double StructuralResyncCooldownMs = 90000.0;
         private const double LongPeriodRealignMs = 300000.0; // 5 min continuous residual divergence
         private static int _consecutiveEconMismatch;
         private static int _consecutiveAsyncEconMismatch;
@@ -306,6 +306,7 @@ namespace TABCoopMod.Sync
             public ulong Id;
             public int Delta;
             public bool Kill;
+            public byte ExpectedTeamFilter; // 0 = any, 1 = player (teamRaw==0), 2 = non-player/zombie (teamRaw!=0)
         }
 
         private sealed class OutgoingPosSyncBatch
@@ -384,7 +385,9 @@ namespace TABCoopMod.Sync
             public float MaxDelta;
             public float RmsDelta;
             public ulong MaxDeltaEntityId;
+            public ulong HostMaxId;
             public bool ExceededThreshold;
+            public bool HasTargetFixesPayload;
             public List<EntityDeltaFix> Deltas;
             public List<EntityLifeFix> LifeFixes;
             public int LifeDiffCount, MissingOnHost, MissingOnClient;
@@ -1762,6 +1765,15 @@ namespace TABCoopMod.Sync
                 }
                 if (FactionContextManager.IsInitialized)
                     FactionContextManager.RecalculateAllFactions();
+            }
+
+            if (!isFirstEntry)
+            {
+                // Anchor resync cooldown AFTER in-game reload finishes so export/transfer/InitLevel time
+                // never eats up the cooldown window and triggers a 10-20s reload loop.
+                _lastAutoResyncTicks = DXHelper_Environment.Ticks;
+                _consecutivePosExceeded = 0;
+                ResetTieredResyncState();
             }
 
             ModLogger.Info($"[CoopSessionManager] Entered synced level at tick {cur} (inputDelay={InputDelayTicks}, role={(Transport.IsHost ? "Host" : "Client")}).");
@@ -4278,6 +4290,13 @@ namespace TABCoopMod.Sync
                 if (structBuilt > 0 || structDestroyed > 0)
                     ModLogger.Info($"[AsyncStructAlign] Tick={item.Tick} built={structBuilt} destroyed={structDestroyed}");
 
+                if ((item.HostMaxId & 0xC000000000000000UL) == 0
+                    && item.HostMaxId < 0x3FFFFFFFFFFFFFFFUL - 1024UL
+                    && (long)item.HostMaxId > LockstepClock.CurrentSyncedEntityIdCounter)
+                {
+                    LockstepClock.SetSyncedEntityIdCounter((long)item.HostMaxId);
+                }
+
                 // Phase 3B: Small dynamic spawn alignment (1..32 missing entities, sorted by ID)
                 int dynSpawned = 0;
                 if (item.DynamicSpawns != null && item.DynamicSpawns.Count > 0 && game != null)
@@ -4326,7 +4345,10 @@ namespace TABCoopMod.Sync
                         DXEntity e = game.GetEntityByID(d.Id);
                         if (e == null || e.Disposed || e.PhysicalType != DXBodyType.Dynamic) continue;
 
+                        bool isZombie = GameBridge.IsZombieType(e.GetType());
                         float dist = (float)Math.Sqrt(d.Dx * d.Dx + d.Dy * d.Dy);
+                        if (!isZombie && dist > MaxAsyncNudgeCells)
+                            continue;
                         if (TryGetActiveUnitOwner(e.ID, item.Tick, e, out byte ownerId)
                             && ownerId == localPid
                             && dist < SelfOwnedHostOverrideThreshold)
@@ -4359,6 +4381,8 @@ namespace TABCoopMod.Sync
                             body.PositionComputed = newPos;
                             body.PhysicPosition = newPos;
                         }
+                        if (isZombie && dist > MaxAsyncNudgeCells)
+                            GameBridge.RefreshEntityFogVisibility(e);
                         _lastEntityPosCorrectedTick[e.ID] = item.Tick;
                         if (dist <= 3.5f)
                             RenderVisualInterpolationPatch.RecordVisualSnapOffset(e.ID, -actualDx, -actualDy);
@@ -4368,6 +4392,12 @@ namespace TABCoopMod.Sync
                                 targetAligned++;
                             if (targetAlignedIds == null) targetAlignedIds = new HashSet<ulong>();
                             targetAlignedIds.Add(e.ID);
+                        }
+                        else if (item.HasTargetFixesPayload && isZombie && dist >= 2.5f)
+                        {
+                            // Host omits idle zombies (tgt==0 && NaN move) from TargetFixes; clear stale Client aggro.
+                            if (GameBridge.TryAlignEntityCombatAndMoveTarget(e, 0UL, float.NaN, float.NaN, alignMoveTarget: true, onlyIfLocalIdle: false))
+                                targetAligned++;
                         }
                         appliedCount++;
                     }
@@ -4417,6 +4447,8 @@ namespace TABCoopMod.Sync
                         // Missing-on-Host kills (Delta==0) are limited to zombies so an ID mismatch can
                         // never delete a player unit or building.
                         if (lf.Kill && lf.Delta == 0 && !GameBridge.IsZombieType(e.GetType())) continue;
+                        if (lf.ExpectedTeamFilter == 1 && !GameBridge.IsPlayerEntity(e)) continue;
+                        if (lf.ExpectedTeamFilter == 2 && GameBridge.IsPlayerEntity(e)) continue;
                         if (GameBridge.TryCorrectLife(e, lf.Delta, lf.Kill))
                         {
                             if (lf.Kill) killsApplied++;
@@ -5339,6 +5371,13 @@ namespace TABCoopMod.Sync
                     var hostSampleMap = (flagHasSpawnMeta || flagHasStructMeta)
                         ? new Dictionary<ulong, StateHasher.EntityPosSample>(hostSamples.Count)
                         : null;
+                    Dictionary<ulong, byte> hostSpawnTeamMap = null;
+                    if (flagHasSpawnMeta && hostSpawnMetas != null)
+                    {
+                        hostSpawnTeamMap = new Dictionary<ulong, byte>(hostSpawnMetas.Count);
+                        for (int i = 0; i < hostSpawnMetas.Count; i++)
+                            hostSpawnTeamMap[hostSpawnMetas[i].Id] = hostSpawnMetas[i].TeamRaw;
+                    }
 
                     for (int i = 0; i < hostSamples.Count; i++)
                     {
@@ -5352,13 +5391,23 @@ namespace TABCoopMod.Sync
                             continue;
                         }
 
+                        byte expTeamFilter = 0;
+                        if (hostSpawnTeamMap != null && hostSpawnTeamMap.TryGetValue(hs.Id, out byte hTeamRaw))
+                        {
+                            bool hIsPlayer = hTeamRaw == 0;
+                            bool cIsZombie = cs.IsZombie;
+                            if (hIsPlayer == cIsZombie)
+                                continue; // Skip ID-collided entity between player unit and zombie.
+                            expTeamFilter = hIsPlayer ? (byte)1 : (byte)2;
+                        }
+
                         // Host-authoritative HP: apply the delta measured at the same epoch tick so
                         // damage taken locally since then is preserved.
                         if (hs.Life != cs.Life)
                         {
                             lifeDiffCount++;
                             if (effectiveApplyLife)
-                                lifeFixes.Add(new EntityLifeFix { Id = hs.Id, Delta = hs.Life - cs.Life, Kill = hs.Life <= 0 });
+                                lifeFixes.Add(new EntityLifeFix { Id = hs.Id, Delta = hs.Life - cs.Life, Kill = hs.Life <= 0, ExpectedTeamFilter = expTeamFilter });
                         }
 
                         if (!cs.IsDynamic) continue;
@@ -5384,7 +5433,7 @@ namespace TABCoopMod.Sync
 
                         if (driftedPosIds15 != null && dist >= 0.15f)
                             driftedPosIds15.Add(hs.Id);
-                        if (apply && dist >= MinAsyncPosSnapCells && dist <= MaxAsyncNudgeCells)
+                        if (apply && dist >= MinAsyncPosSnapCells && (cs.IsZombie || dist <= MaxAsyncNudgeCells))
                             deltas.Add(new EntityDeltaFix { Id = hs.Id, Dx = dx, Dy = dy });
                     }
 
@@ -5501,9 +5550,9 @@ namespace TABCoopMod.Sync
                         }
                     }
 
-                    // Phase 3B: Small dynamic entity spawns (1..32 missing on client, <= 8 missing on host)
+                    // Phase 3B: Small dynamic entity spawns (1..32 missing on client, <= 64 missing on host)
                     List<DynamicSpawnSample> dynamicSpawns = null;
-                    if (apply && flagHasSpawnMeta && hostSpawnMetas != null && hostSampleMap != null && missingOnHost <= 8)
+                    if (apply && flagHasSpawnMeta && hostSpawnMetas != null && hostSampleMap != null && missingOnHost <= 64)
                     {
                         var pendingSpawns = new List<DynamicSpawnSample>(32);
                         for (int i = 0; i < hostSpawnMetas.Count; i++)
@@ -5551,7 +5600,9 @@ namespace TABCoopMod.Sync
                         MaxDelta = maxDelta,
                         RmsDelta = rmsDelta,
                         MaxDeltaEntityId = maxDeltaId,
+                        HostMaxId = hostMaxId,
                         ExceededThreshold = exceededThreshold,
+                        HasTargetFixesPayload = apply && flagHasTargetMeta,
                         Deltas = effectiveApplyPos ? deltas : null,
                         LifeFixes = lifeFixes,
                         LifeDiffCount = lifeDiffCount,

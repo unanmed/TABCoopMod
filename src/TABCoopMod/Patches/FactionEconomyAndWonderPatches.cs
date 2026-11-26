@@ -758,15 +758,24 @@ namespace TABCoopMod.Patches
             if (maxInstances <= 0)
                 return true;
 
-            if (!MultiFactionTechAndLimitHelpers.CallCreateEntityBaseIsVisible(__instance, __0))
+            byte owner = MultiFactionTechAndLimitHelpers.ResolveActivePlayer(__0);
+            bool pushedContext = FactionContextManager.CurrentActiveOwner != owner;
+            if (pushedContext) FactionContextManager.PushContext(owner);
+            try
             {
-                __result = false;
+                if (!MultiFactionTechAndLimitHelpers.CallCreateEntityBaseIsVisible(__instance, __0))
+                {
+                    __result = false;
+                    return false;
+                }
+
+                __result = MultiFactionTechAndLimitHelpers.CountOwnedEntitiesOfType(entType, owner) < maxInstances;
                 return false;
             }
-
-            byte owner = MultiFactionTechAndLimitHelpers.ResolveActivePlayer(__0);
-            __result = MultiFactionTechAndLimitHelpers.CountOwnedEntitiesOfType(entType, owner) < maxInstances;
-            return false;
+            finally
+            {
+                if (pushedContext) FactionContextManager.PopContext();
+            }
         }
     }
 
@@ -783,8 +792,9 @@ namespace TABCoopMod.Patches
         }
 
         [HarmonyPrefix]
-        public static bool Prefix(object __instance, object __0, ref bool __result)
+        public static bool Prefix(object __instance, object __0, ref bool __result, out bool __state)
         {
+            __state = false;
             if (!CoopSessionManager.IsMultiFactionActive || !FactionContextManager.IsInitialized || __instance == null)
                 return true;
 
@@ -792,6 +802,13 @@ namespace TABCoopMod.Patches
                 _pEntityTypeProp = __instance.GetType().GetProperty("EntityType", BindingFlags.Public | BindingFlags.Instance);
             Type entType = _pEntityTypeProp?.GetValue(__instance) as Type;
             if (entType == null) return true;
+
+            byte owner = MultiFactionTechAndLimitHelpers.ResolveActivePlayer(__0);
+            if (FactionContextManager.CurrentActiveOwner != owner)
+            {
+                FactionContextManager.PushContext(owner);
+                __state = true;
+            }
 
             if (WonderCrowdfundManager.IsInitialized && WonderCrowdfundManager.TryClassifyEntityType(entType, out var fKind))
             {
@@ -820,7 +837,7 @@ namespace TABCoopMod.Patches
                         bool engOk = engReq <= 0 || freeEng >= engReq;
                         __result = workersOk && foodOk && engOk;
                         if (!__result)
-                            ModLogger.Info($"[WonderCrowdfund] CanExecute({fKind}) false: need(W={workReq},F={foodReq},E={engReq}), avail(W={freeWorkers},F={freeFood},E={freeEng})");
+                            ModLogger.Info($"[WonderCrowdfund] CanExecute({fKind}, P{owner}) false: need(W={workReq},F={foodReq},E={engReq}), avail(W={freeWorkers},F={freeFood},E={freeEng})");
                         return false;
                     }
                 }
@@ -838,7 +855,6 @@ namespace TABCoopMod.Patches
             if (maxInstances <= 0 && minColonists <= 0 && buildingReq == null)
                 return true;
 
-            byte owner = MultiFactionTechAndLimitHelpers.ResolveActivePlayer(__0);
             int ownedCount = MultiFactionTechAndLimitHelpers.CountOwnedEntitiesOfType(entType, owner);
 
             if (maxInstances > 0 && ownedCount >= maxInstances)
@@ -876,6 +892,12 @@ namespace TABCoopMod.Patches
             __result = MultiFactionTechAndLimitHelpers.CallZXCommandBaseCanExecute(__instance, __0);
             return false;
         }
+
+        [HarmonyFinalizer]
+        public static void Finalizer(bool __state)
+        {
+            if (__state) FactionContextManager.PopContext();
+        }
     }
 
     /// <summary>
@@ -893,16 +915,23 @@ namespace TABCoopMod.Patches
         }
 
         [HarmonyPrefix]
-        public static bool Prefix(object __instance, object __0, ref bool __result)
+        public static bool Prefix(object __instance, object __0, ref bool __result, out bool __state)
         {
+            __state = false;
             if (!CoopSessionManager.IsMultiFactionActive || !FactionContextManager.IsInitialized || __instance == null)
                 return true;
+
+            byte owner = MultiFactionTechAndLimitHelpers.ResolveActivePlayer(__0);
+            if (FactionContextManager.CurrentActiveOwner != owner)
+            {
+                FactionContextManager.PushContext(owner);
+                __state = true;
+            }
 
             Type buildingReq = GameBridge.GetCommandBuildingRequisite(__instance);
             if (buildingReq == null)
                 return true;
 
-            byte owner = MultiFactionTechAndLimitHelpers.ResolveActivePlayer(__0);
             if (!MultiFactionTechAndLimitHelpers.HasOwnedEnabledEntityOfType(buildingReq, owner))
             {
                 GameBridge.SetCommandErrorMessage(__instance, $"Requires {GameBridge.GetEntityTemplateDisplayName(buildingReq)}");
@@ -911,6 +940,12 @@ namespace TABCoopMod.Patches
             }
 
             return true;
+        }
+
+        [HarmonyFinalizer]
+        public static void Finalizer(bool __state)
+        {
+            if (__state) FactionContextManager.PopContext();
         }
     }
 
@@ -937,55 +972,64 @@ namespace TABCoopMod.Patches
             if (!CoopSessionManager.IsMultiFactionActive || !FactionContextManager.IsInitialized || __instance == null)
                 return true;
 
-            if (!MultiFactionTechAndLimitHelpers.CallZXCommandBaseIsVisible(__instance, __0))
-            {
-                __result = false;
-                return false;
-            }
-
-            if (_pEntitiesProvided == null)
-                _pEntitiesProvided = GameBridge.TypeTechnology?.GetProperty("EntitiesProvided", BindingFlags.Public | BindingFlags.Instance);
-            var provided = _pEntitiesProvided?.GetValue(__instance) as IList<Type>;
-            if (provided == null || provided.Count == 0)
-            {
-                __result = true;
-                return false;
-            }
-
             byte owner = MultiFactionTechAndLimitHelpers.ResolveActivePlayer(__0);
-            bool allBlocked = true;
-            for (int i = 0; i < provided.Count; i++)
+            bool pushedContext = FactionContextManager.CurrentActiveOwner != owner;
+            if (pushedContext) FactionContextManager.PushContext(owner);
+            try
             {
-                Type entType = provided[i];
-                if (entType == null) continue;
-
-                if (WonderCrowdfundManager.IsInitialized && WonderCrowdfundManager.TryClassifyEntityType(entType, out var fKind))
+                if (!MultiFactionTechAndLimitHelpers.CallZXCommandBaseIsVisible(__instance, __0))
                 {
-                    if (!WonderCrowdfundManager.IsWonderBlockedGlobally(fKind))
+                    __result = false;
+                    return false;
+                }
+
+                if (_pEntitiesProvided == null)
+                    _pEntitiesProvided = GameBridge.TypeTechnology?.GetProperty("EntitiesProvided", BindingFlags.Public | BindingFlags.Instance);
+                var provided = _pEntitiesProvided?.GetValue(__instance) as IList<Type>;
+                if (provided == null || provided.Count == 0)
+                {
+                    __result = true;
+                    return false;
+                }
+
+                bool allBlocked = true;
+                for (int i = 0; i < provided.Count; i++)
+                {
+                    Type entType = provided[i];
+                    if (entType == null) continue;
+
+                    if (WonderCrowdfundManager.IsInitialized && WonderCrowdfundManager.TryClassifyEntityType(entType, out var fKind))
+                    {
+                        if (!WonderCrowdfundManager.IsWonderBlockedGlobally(fKind))
+                        {
+                            allBlocked = false;
+                            break;
+                        }
+                        continue;
+                    }
+
+                    var tmpl = DXGame.Current?.GetEntityFromType(entType) as DXEntity;
+                    object dp = tmpl != null ? GameBridge.GetEntityDefaultParamsBoxed(tmpl) : null;
+                    if (dp == null)
                     {
                         allBlocked = false;
                         break;
                     }
-                    continue;
+                    GameBridge.ReadEntityBuildLimits(dp, out int maxInstances, out _, out _);
+                    if (maxInstances <= 0 || MultiFactionTechAndLimitHelpers.CountOwnedEntitiesOfType(entType, owner) < maxInstances)
+                    {
+                        allBlocked = false;
+                        break;
+                    }
                 }
 
-                var tmpl = DXGame.Current?.GetEntityFromType(entType) as DXEntity;
-                object dp = tmpl != null ? GameBridge.GetEntityDefaultParamsBoxed(tmpl) : null;
-                if (dp == null)
-                {
-                    allBlocked = false;
-                    break;
-                }
-                GameBridge.ReadEntityBuildLimits(dp, out int maxInstances, out _, out _);
-                if (maxInstances <= 0 || MultiFactionTechAndLimitHelpers.CountOwnedEntitiesOfType(entType, owner) < maxInstances)
-                {
-                    allBlocked = false;
-                    break;
-                }
+                __result = !allBlocked;
+                return false;
             }
-
-            __result = !allBlocked;
-            return false;
+            finally
+            {
+                if (pushedContext) FactionContextManager.PopContext();
+            }
         }
     }
 
