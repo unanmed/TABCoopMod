@@ -1,10 +1,10 @@
-# package_release.ps1
+﻿# package_release.ps1
 # Builds TABCoopMod (Release) and packages a drag-and-drop archive into dist/
 # containing ONLY runtime files + a plain-text user guide (no install scripts).
 
 param(
     [string]$WorkspaceDir = "",
-    [string]$Version = "v0.2.8-6p"
+    [string]$Version = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -12,6 +12,21 @@ $ErrorActionPreference = "Stop"
 
 if ([string]::IsNullOrWhiteSpace($WorkspaceDir)) {
     $WorkspaceDir = Split-Path -Parent $PSScriptRoot
+}
+
+# Keep the zip name / config version in sync with ModInfo.cs unless -Version is passed explicitly.
+$modInfoPath = Join-Path $WorkspaceDir "src\TABCoopMod\Core\ModInfo.cs"
+$asmVersion = "0.2.8.0"
+$modVersion = "0.2.8-6p"
+if (Test-Path $modInfoPath) {
+    $modInfoText = Get-Content $modInfoPath -Raw
+    $mv = [regex]::Match($modInfoText, 'Version\s*=\s*"([^"]+)"')
+    if ($mv.Success) { $modVersion = $mv.Groups[1].Value }
+    $av = [regex]::Match($modInfoText, 'AssemblyVersion\s*=\s*"([^"]+)"')
+    if ($av.Success) { $asmVersion = $av.Groups[1].Value }
+}
+if ([string]::IsNullOrWhiteSpace($Version)) {
+    $Version = "v$modVersion"
 }
 
 Write-Host "[1/3] Building TABCoopMod (Release)..."
@@ -32,16 +47,21 @@ if (Test-Path $stageDir) {
 }
 New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
 
-Copy-Item (Join-Path $binDir "TABCoopMod.dll") (Join-Path $stageDir "TABCoopMod.dll") -Force
-Copy-Item (Join-Path $binDir "TABCoopMod.pdb") (Join-Path $stageDir "TABCoopMod.pdb") -Force
-Copy-Item (Join-Path $binDir "0Harmony.dll") (Join-Path $stageDir "0Harmony.dll") -Force
+$requiredFiles = @("TABCoopMod.dll", "0Harmony.dll")
+foreach ($file in $requiredFiles) {
+    $src = Join-Path $binDir $file
+    if (-not (Test-Path $src)) {
+        throw "Required build output missing: $src"
+    }
+    Copy-Item $src (Join-Path $stageDir $file) -Force
+}
+
+$pdbPath = Join-Path $binDir "TABCoopMod.pdb"
+if (Test-Path $pdbPath) {
+    Copy-Item $pdbPath (Join-Path $stageDir "TABCoopMod.pdb") -Force
+}
 
 [System.IO.File]::WriteAllText((Join-Path $stageDir "steam_appid.txt"), "644930")
-
-$asmVersion = "0.2.8.0"
-if ($Version -match '(\d+)\.(\d+)\.(\d+)') {
-    $asmVersion = "$($Matches[1]).$($Matches[2]).$($Matches[3]).0"
-}
 
 $configXml = @"
 <?xml version="1.0" encoding="utf-8"?>
@@ -154,8 +174,27 @@ Write-Host "[3/3] Creating zip archive at $zipPath..."
 if (Test-Path $zipPath) {
     Remove-Item $zipPath -Force
 }
-Compress-Archive -Path (Join-Path $stageDir "*") -DestinationPath $zipPath -CompressionLevel Optimal
+Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
+# Use the Encoding overload so non-ASCII filenames (e.g. the Chinese guide) are stored
+# as UTF-8 entries instead of being mangled by Compress-Archive on Windows PowerShell 5.1.
+[System.IO.Compression.ZipFile]::CreateFromDirectory(
+    $stageDir,
+    $zipPath,
+    [System.IO.Compression.CompressionLevel]::Optimal,
+    $false,
+    [System.Text.Encoding]::UTF8)
 
 Write-Host "Release package created successfully!"
-Get-ChildItem $stageDir | Select-Object Name, Length
+Write-Host "Zip contents:"
+$zip = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+try {
+    $zip.Entries | Select-Object FullName, Length | Format-Table -AutoSize
+}
+finally {
+    $zip.Dispose()
+}
 Get-Item $zipPath | Select-Object FullName, Length
+
+# Keep dist/ clean: only the zip remains.
+Remove-Item $stageDir -Recurse -Force
+Write-Host "Staging directory cleaned: $stageDir"
