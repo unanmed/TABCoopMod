@@ -102,7 +102,7 @@ namespace TABCoopMod.Networking
         private bool _lobbyCreateTimedOut;
         private readonly List<PeerInfo> _peers = new List<PeerInfo>();
         private readonly Dictionary<byte, CSteamID> _playerToSteamId = new Dictionary<byte, CSteamID>();
-        private int _maxPlayers = 3;
+        private int _maxPlayers = CoopLimits.MaxPlayers;
 
         private DirectFastPathManager _direct;
         private readonly ConcurrentQueue<Action> _mainThreadActions = new ConcurrentQueue<Action>();
@@ -207,7 +207,7 @@ namespace TABCoopMod.Networking
             _cbP2PConnectFail = null;
         }
 
-        public void StartHost(int maxPlayers = 3)
+        public void StartHost(int maxPlayers = CoopLimits.MaxPlayers)
         {
             if (_disposed) return;
             if (!SteamAPI.IsSteamRunning())

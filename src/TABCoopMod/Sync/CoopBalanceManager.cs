@@ -18,6 +18,10 @@ namespace TABCoopMod.Sync
     public sealed class SurvivalBalanceProfile
     {
         public int PlayerCount { get; set; }
+        // Actual lobby player count (2..MaxPlayers).
+        public int ActualPlayerCount { get; set; }
+        // Which enhancement tier (2 or 3) supplies map/unit/swarm scaling.
+        public int BalanceScalePlayerCount { get; set; }
         public bool IsActive { get; set; }
         public int TargetNCells { get; set; }
         public float MapScale { get; set; }
@@ -60,12 +64,14 @@ namespace TABCoopMod.Sync
 
         public static SurvivalBalanceProfile GetMultiFactionProfileForPlayerCount(int playerCount, CoopBalancePreset preset)
         {
-            int n = Math.Max(2, Math.Min(3, playerCount));
+            int n = Math.Max(2, Math.Min(CoopLimits.MaxFactionPlayers, playerCount));
             bool balanced = preset == CoopBalancePreset.Balanced;
             int targetNCells = n >= 3 ? 416 : 360;
             return new SurvivalBalanceProfile
             {
                 PlayerCount = n,
+                ActualPlayerCount = n,
+                BalanceScalePlayerCount = n,
                 IsActive = true,
                 TargetNCells = targetNCells,
                 MapScale = targetNCells / 256f,
@@ -80,13 +86,20 @@ namespace TABCoopMod.Sync
             };
         }
 
-        public static SurvivalBalanceProfile GetProfileForPlayerCount(int playerCount, CoopBalancePreset preset)
+        public static SurvivalBalanceProfile GetProfileForPlayerCount(
+            int playerCount,
+            CoopBalancePreset preset,
+            int balanceEnhancementPlayers = 0)
         {
-            if (preset == CoopBalancePreset.Vanilla || playerCount < 2)
+            int actual = Math.Max(1, playerCount);
+
+            if (preset == CoopBalancePreset.Vanilla || actual < 2)
             {
                 return new SurvivalBalanceProfile
                 {
-                    PlayerCount = Math.Max(1, playerCount),
+                    PlayerCount = actual,
+                    ActualPlayerCount = actual,
+                    BalanceScalePlayerCount = actual,
                     IsActive = false,
                     TargetNCells = 256,
                     MapScale = 1.0f,
@@ -101,11 +114,20 @@ namespace TABCoopMod.Sync
                 };
             }
 
-            if (playerCount == 2)
+            // Balance scaling is independent from the actual lobby size. A 6-player room can
+            // deliberately use the 2P or 3P enhancement tier to keep map/infected pressure sane.
+            int scale = balanceEnhancementPlayers > 0
+                ? balanceEnhancementPlayers
+                : Math.Min(actual, CoopLimits.MaxBalanceEnhancementPlayers);
+            scale = Math.Max(2, Math.Min(CoopLimits.MaxBalanceEnhancementPlayers, scale));
+
+            if (scale == 2)
             {
                 return new SurvivalBalanceProfile
                 {
                     PlayerCount = 2,
+                    ActualPlayerCount = actual,
+                    BalanceScalePlayerCount = 2,
                     IsActive = true,
                     TargetNCells = 280,
                     MapScale = 280f / 256f,
@@ -123,6 +145,8 @@ namespace TABCoopMod.Sync
             return new SurvivalBalanceProfile
             {
                 PlayerCount = 3,
+                ActualPlayerCount = actual,
+                BalanceScalePlayerCount = 3,
                 IsActive = true,
                 TargetNCells = 304,
                 MapScale = 304f / 256f,
@@ -201,7 +225,10 @@ namespace TABCoopMod.Sync
             if (players < 2)
                 return false;
 
-            profile = GetProfileForPlayerCount(players, CoopSessionManager.BalancePreset);
+            profile = GetProfileForPlayerCount(
+                players,
+                CoopSessionManager.BalancePreset,
+                CoopSessionManager.GetEffectiveBalanceEnhancementPlayers());
             return profile.IsActive;
         }
 
@@ -272,7 +299,7 @@ namespace TABCoopMod.Sync
 
                 GameBridge.SetRandomParamsNCells(randomLevelParams, profile.TargetNCells);
                 _activeProfile = profile;
-                ModLogger.Info($"[CoopBalance] Pre-gen applied: players={profile.PlayerCount}, NCells={profile.TargetNCells}, mapScale={profile.MapScale:F3}, areaScale={profile.AreaScale:F2}.");
+                ModLogger.Info($"[CoopBalance] Pre-gen applied: actualPlayers={profile.ActualPlayerCount}, scalePlayers={profile.BalanceScalePlayerCount}, NCells={profile.TargetNCells}, mapScale={profile.MapScale:F3}, areaScale={profile.AreaScale:F2}.");
             }
             catch (Exception ex)
             {
@@ -326,7 +353,7 @@ namespace TABCoopMod.Sync
                 bool extrasSet = GameBridge.AddLevelStateCommandCenterExtras(profile.ExtraWorkers, profile.ExtraFood);
 
                 ModLogger.Info(
-                    $"[CoopBalance] Post-gen complete: players={profile.PlayerCount}, multiBases={multiBaseCount}, NCells={GameBridge.GetRandomParamsNCells(randomLevelParams)}, " +
+                    $"[CoopBalance] Post-gen complete: actualPlayers={profile.ActualPlayerCount}, scalePlayers={profile.BalanceScalePlayerCount}, multiBases={multiBaseCount}, NCells={GameBridge.GetRandomParamsNCells(randomLevelParams)}, " +
                     $"scaledEvents={scaledEvents}, extraUnits={spawnedUnits} (+{profile.ExtraRangers} Ranger, +{profile.ExtraSoldiers} Soldier), " +
                     $"ccExtras=(+{profile.ExtraWorkers} workers, +{profile.ExtraFood} food, applied={extrasSet}).");
             }

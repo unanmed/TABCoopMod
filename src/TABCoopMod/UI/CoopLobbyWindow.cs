@@ -14,7 +14,7 @@ namespace TABCoopMod.UI
     /// <summary>
     /// Native ZXWindow-based RTS Waiting Room UI for Archon Mode Co-op.
     /// Supports Entry view (Create Steam/Loopback room, auto-probe & join local 127.0.0.1:27099)
-    /// and Room view (3-slot Archon roster with player colors & Ready state, Steam friend invite,
+    /// and Room view (MaxPlayers-slot Archon roster with player colors & Ready state, Steam friend invite,
     /// Host single-player menu reuse for Load/New Survival/Custom Map, and Client Ready toggle).
     /// </summary>
     public static class CoopLobbyWindow
@@ -66,13 +66,6 @@ namespace TABCoopMod.UI
             new ChaosPresetDef { Name = "恶劣", LatencyMs = 220, JitterMs = 80, LossRate = 0.10 }
         };
 
-        private static readonly Color[] SlotColors =
-        {
-            Color.DodgerBlue,
-            Color.SpringGreen,
-            Color.Orange
-        };
-
         private static readonly Color PanelBgColor = Color.FromArgb(205, 14, 19, 24);
         private static readonly Color SlotBgActiveColor = Color.FromArgb(220, 22, 30, 38);
         private static readonly Color SlotBgEmptyColor = Color.FromArgb(150, 14, 18, 22);
@@ -114,7 +107,7 @@ namespace TABCoopMod.UI
 
         // Room View widgets
         private static DXTextObject _rosterHeaderText;
-        private static readonly PlayerSlotRow[] _slots = new PlayerSlotRow[3];
+        private static readonly PlayerSlotRow[] _slots = new PlayerSlotRow[CoopLimits.MaxPlayers];
         private static DXTextObject _roomStatusBanner;
         private static DXButton _btnInviteSteam;
         private static DXButton _btnHostLoadSave;
@@ -129,6 +122,8 @@ namespace TABCoopMod.UI
         private static DXTextComboBox _cmbBalancePreset;
         private static DXTextComboBox _cmbSpawnMode;
         private static DXTextComboBox _cmbDefeatRule;
+        private static DXTextObject _lblBalanceEnhance;
+        private static DXTextComboBox _cmbBalanceEnhance;
         private static bool _suppressComboEvents;
         private static bool _comboThemeApplied;
         private static System.Reflection.FieldInfo _comboTextField;
@@ -415,6 +410,7 @@ namespace TABCoopMod.UI
             try { _cmbBalancePreset?.ListView?.RemoveFromScene(); } catch { }
             try { _cmbSpawnMode?.ListView?.RemoveFromScene(); } catch { }
             try { _cmbDefeatRule?.ListView?.RemoveFromScene(); } catch { }
+            try { _cmbBalanceEnhance?.ListView?.RemoveFromScene(); } catch { }
         }
 
         private static void CloseLobbyModalOnly(Action onClosed)
@@ -519,7 +515,7 @@ namespace TABCoopMod.UI
 
             var steamDesc = CreateTextBox(padLeft, 40f * u + _btnCreateSteam.Height + 6f * u, leftW - padLeft * 2f, 44f * u,
                 10.5f * u, FontStyle.Regular, Color.Silver, ContentAlignment.TopLeft, Color.Transparent, Color.Transparent, 0f);
-            steamDesc.Text = "创建仅 Steam 好友可见的 2~3 人合作大厅，\n进入等候房间后可通过 Shift+Tab 邀请好友。";
+            steamDesc.Text = $"创建仅 Steam 好友可见的 2~{CoopLimits.MaxPlayers} 人合作大厅，\n进入等候房间后可通过 Shift+Tab 邀请好友。";
             _entryView.AddObject(steamDesc);
 
             float secondBtnY = steamDesc.Y + steamDesc.Height + 18f * u;
@@ -599,17 +595,18 @@ namespace TABCoopMod.UI
             _roomView.AddObject(_rosterHeaderText);
 
             float slotY = 34f * u;
-            float slotH = 50f * u;
-            float slotGap = 8f * u;
+            bool compactSlots = CoopLimits.MaxPlayers > 3;
+            float slotH = (compactSlots ? 38f : 50f) * u;
+            float slotGap = (compactSlots ? 6f : 8f) * u;
 
-            for (int i = 0; i < 3; i++)
+            for (int i = 0; i < CoopLimits.MaxPlayers; i++)
             {
                 float y = slotY + i * (slotH + slotGap);
                 var bg = CreateSolidBox(0f, y, leftW, slotH, SlotBgEmptyColor, BorderDimColor, 1.5f);
                 _roomView.AddObject(bg);
 
                 // Child coordinates are relative to bg so swatches/labels render in front of slot card bg.
-                var swatch = CreateSolidBox(2f * u, 2f * u, 8f * u, slotH - 4f * u, SlotColors[i], Color.Transparent, 0f);
+                var swatch = CreateSolidBox(2f * u, 2f * u, 8f * u, slotH - 4f * u, CoopLimits.GetPlayerColor(i + 1), Color.Transparent, 0f);
                 bg.AddObject(swatch);
 
                 var nameLbl = CreateTextBox(18f * u, 0f, leftW - 145f * u, slotH, 11.5f * u, FontStyle.Bold, Color.WhiteSmoke,
@@ -629,7 +626,7 @@ namespace TABCoopMod.UI
                 };
             }
 
-            float bannerY = slotY + 3f * slotH + 2f * slotGap + 8f * u;
+            float bannerY = slotY + CoopLimits.MaxPlayers * slotH + (CoopLimits.MaxPlayers - 1) * slotGap + 8f * u;
             float bannerH = 52f * u;
             _roomStatusBanner = CreateTextBox(0f, bannerY, leftW, bannerH,
                 10.5f * u, FontStyle.Bold, Color.Gold, ContentAlignment.MiddleCenter, PanelBgColor, BorderGoldColor, 1.5f);
@@ -685,7 +682,9 @@ namespace TABCoopMod.UI
             float row1CmbY = row1LblY + lblH + 2f * u;
             float row2LblY = row1CmbY + cmbH + 5f * u;
             float row2CmbY = row2LblY + lblH + 2f * u;
-            float settingsH = (row2CmbY + cmbH + 6f * u) - settingsTop;
+            float row3LblY = row2CmbY + cmbH + 5f * u;
+            float row3CmbY = row3LblY + lblH + 2f * u;
+            float settingsH = (row3CmbY + cmbH + 6f * u) - settingsTop;
 
             _roomSettingsPanelBg = CreateSolidBox(rightX, settingsTop, rightW, settingsH, PanelBgColor, BorderGoldColor, 1f);
             _roomSettingsPanelBg.Z = -10;
@@ -698,7 +697,7 @@ namespace TABCoopMod.UI
             _roomView.AddObject(_lblGameMode);
 
             _cmbGameMode = CreateNativeComboBox(
-                new List<string> { "执政官共控", "独立基地 (M4)" },
+                new List<string> { "执政官共控", "独立基地 (M4, 最多3人)" },
                 CoopSessionManager.GameMode == CoopGameMode.MultiFaction ? 1 : 0,
                 col1X, row1CmbY, colW, cmbH, idx =>
                 {
@@ -758,6 +757,23 @@ namespace TABCoopMod.UI
                 });
             _cmbDefeatRule.Z = 10;
             _roomView.AddObject(_cmbDefeatRule);
+
+            _lblBalanceEnhance = CreateTextBox(col1X, row3LblY, rightW - settingsPadX * 2f, lblH, 9f * u, FontStyle.Bold, Color.Khaki,
+                ContentAlignment.MiddleLeft, Color.Transparent, Color.Transparent, 0f);
+            _lblBalanceEnhance.Text = "平衡增强 (仅联机均衡生效)";
+            _lblBalanceEnhance.Z = 5;
+            _roomView.AddObject(_lblBalanceEnhance);
+
+            _cmbBalanceEnhance = CreateNativeComboBox(
+                new List<string> { "自动 (按人数, ≤3)", "2人增强", "3人增强" },
+                BalanceEnhancementToIndex(CoopSessionManager.BalanceEnhancementPlayers),
+                col1X, row3CmbY, rightW - settingsPadX * 2f, cmbH, idx =>
+                {
+                    CoopSessionManager.SetBalanceEnhancementPlayers(BalanceEnhancementFromIndex(idx));
+                    RefreshUI();
+                });
+            _cmbBalanceEnhance.Z = 10;
+            _roomView.AddObject(_cmbBalanceEnhance);
 
             _btnDisbandRoom = CreateNativeButton("解散房间", rightX, leaveY, -120, LeaveOrDisbandClicked);
             _roomView.AddObject(_btnDisbandRoom);
@@ -934,10 +950,11 @@ namespace TABCoopMod.UI
             var peers = CoopSessionManager.GetEffectivePeers();
 
             bool isMultiFaction = CoopSessionManager.GameMode == CoopGameMode.MultiFaction;
+            bool isBalanced = CoopSessionManager.BalancePreset == CoopBalancePreset.Balanced;
             string modeTitle = isMultiFaction ? "独立基地合作 (M4)" : "执政官共控模式";
-            SetDynamicText(_rosterHeaderText, $"房间成员 ({peers.Count} / 3) — {modeTitle}");
+            SetDynamicText(_rosterHeaderText, $"房间成员 ({peers.Count} / {CoopLimits.MaxPlayers}) — {modeTitle}");
 
-            for (int i = 0; i < 3; i++)
+            for (int i = 0; i < CoopLimits.MaxPlayers; i++)
             {
                 byte slotPlayerId = (byte)(i + 1);
                 PeerInfo match = null;
@@ -951,8 +968,9 @@ namespace TABCoopMod.UI
                 {
                     bool isMe = match.PlayerId == localId;
                     bool isSlotHost = match.PlayerId == 1;
-                    SetSolidBoxColors(row.Background, SlotBgActiveColor, isMe ? SlotColors[i] : BorderGoldColor);
-                    SetSolidBoxColors(row.Swatch, SlotColors[i], Color.Transparent);
+                    Color slotColor = CoopLimits.GetPlayerColor(slotPlayerId);
+                    SetSolidBoxColors(row.Background, SlotBgActiveColor, isMe ? slotColor : BorderGoldColor);
+                    SetSolidBoxColors(row.Swatch, slotColor, Color.Transparent);
 
                     SetDynamicText(row.NameLabel, $"P{slotPlayerId} · {match.PlayerName}{(isMe ? " (我)" : "")}",
                         textColor: Color.WhiteSmoke);
@@ -973,7 +991,7 @@ namespace TABCoopMod.UI
                 else
                 {
                     SetSolidBoxColors(row.Background, SlotBgEmptyColor, BorderDimColor);
-                    SetSolidBoxColors(row.Swatch, Color.FromArgb(90, SlotColors[i]), Color.Transparent);
+                    SetSolidBoxColors(row.Swatch, Color.FromArgb(90, CoopLimits.GetPlayerColor(slotPlayerId)), Color.Transparent);
 
                     SetDynamicText(row.NameLabel, $"P{slotPlayerId} · 空位（等待玩家加入）",
                         textColor: Color.DimGray);
@@ -996,10 +1014,16 @@ namespace TABCoopMod.UI
             if (_cmbSpawnMode != null) _cmbSpawnMode.Visible = isHost && isMultiFaction;
             if (_lblDefeatRule != null) _lblDefeatRule.Visible = isHost && isMultiFaction;
             if (_cmbDefeatRule != null) _cmbDefeatRule.Visible = isHost && isMultiFaction;
+            if (_lblBalanceEnhance != null) _lblBalanceEnhance.Visible = isHost && isBalanced && !isMultiFaction;
+            if (_cmbBalanceEnhance != null) _cmbBalanceEnhance.Visible = isHost && isBalanced && !isMultiFaction;
             if (!isHost || !isMultiFaction)
             {
                 try { _cmbSpawnMode?.ListView?.RemoveFromScene(); } catch { }
                 try { _cmbDefeatRule?.ListView?.RemoveFromScene(); } catch { }
+            }
+            if (!isHost || !isBalanced || isMultiFaction)
+            {
+                try { _cmbBalanceEnhance?.ListView?.RemoveFromScene(); } catch { }
             }
             if (!isHost) DismissOpenComboDropdowns();
             _btnDisbandRoom.Visible = isHost;
@@ -1008,7 +1032,6 @@ namespace TABCoopMod.UI
             _clientHintText.Visible = !isHost;
             _btnLeaveRoom.Visible = !isHost;
 
-            bool isBalanced = CoopSessionManager.BalancePreset == CoopBalancePreset.Balanced;
             string presetDesc = CoopBalanceManager.DescribePreset(CoopSessionManager.BalancePreset);
 
             if (isHost)
@@ -1077,6 +1100,15 @@ namespace TABCoopMod.UI
                         {
                             ResetComboTextSurface(_cmbDefeatRule);
                             _cmbDefeatRule.SelectedIndex = desired;
+                        }
+                    }
+                    if (_cmbBalanceEnhance != null)
+                    {
+                        int desired = BalanceEnhancementToIndex(CoopSessionManager.BalanceEnhancementPlayers);
+                        if (_cmbBalanceEnhance.SelectedIndex != desired)
+                        {
+                            ResetComboTextSurface(_cmbBalanceEnhance);
+                            _cmbBalanceEnhance.SelectedIndex = desired;
                         }
                     }
                 }
@@ -1285,8 +1317,11 @@ namespace TABCoopMod.UI
                 else
                 {
                     string presetLabel = CoopBalanceManager.DescribePreset(CoopSessionManager.BalancePreset);
+                    string enhLabel = CoopSessionManager.BalancePreset == CoopBalancePreset.Balanced
+                        ? $" / 增强 {CoopSessionManager.GetEffectiveBalanceEnhancementPlayers()}人"
+                        : string.Empty;
                     SetDynamicText(_roomStatusBanner,
-                        $"全员已准备就绪！请在右侧开启游戏\n新生存预设: {presetLabel}",
+                        $"全员已准备就绪！请在右侧开启游戏\n新生存预设: {presetLabel}{enhLabel}",
                         textColor: Color.SpringGreen, borderColor: Color.SpringGreen);
                 }
                 return;
@@ -1536,6 +1571,20 @@ namespace TABCoopMod.UI
             });
         }
 
+        private static int BalanceEnhancementToIndex(int value)
+        {
+            if (value == 2) return 1;
+            if (value >= 3) return 2;
+            return 0;
+        }
+
+        private static int BalanceEnhancementFromIndex(int idx)
+        {
+            if (idx == 1) return 2;
+            if (idx == 2) return 3;
+            return 0;
+        }
+
         private static string DescribePhase(LobbyRoomPhase phase)
         {
             switch (phase)
@@ -1571,6 +1620,7 @@ namespace TABCoopMod.UI
             StyleLobbyComboBox(_cmbBalancePreset, u);
             StyleLobbyComboBox(_cmbSpawnMode, u);
             StyleLobbyComboBox(_cmbDefeatRule, u);
+            StyleLobbyComboBox(_cmbBalanceEnhance, u);
         }
 
         private static void StyleLobbyComboBox(DXTextComboBox cb, float u)

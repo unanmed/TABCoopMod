@@ -453,7 +453,7 @@ namespace TABCoopMod.Commands
             bool swappedContext = false;
             if (TABCoopMod.Sync.CoopSessionManager.IsMultiFactionActive
                 && TABCoopMod.Sync.FactionContextManager.IsInitialized
-                && netCmd.PlayerId >= 1 && netCmd.PlayerId <= 3)
+                && netCmd.PlayerId >= 1 && netCmd.PlayerId <= TABCoopMod.Core.CoopLimits.MaxFactionPlayers)
             {
                 TABCoopMod.Sync.FactionContextManager.PushContext(netCmd.PlayerId);
                 swappedContext = true;

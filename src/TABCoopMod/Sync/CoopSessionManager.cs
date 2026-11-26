@@ -59,6 +59,8 @@ namespace TABCoopMod.Sync
         public static int CurrentSessionSeed { get; private set; } = SyncSeed;
         public static LobbyRoomPhase RoomPhase { get; private set; } = LobbyRoomPhase.Idle;
         public static CoopBalancePreset BalancePreset { get; private set; } = CoopBalancePreset.Balanced;
+        // 0 = auto (actual player count, capped at MaxBalanceEnhancementPlayers); 2/3 = explicit scaling tier.
+        public static int BalanceEnhancementPlayers { get; private set; } = 0;
         public static CoopGameMode GameMode { get; private set; } = CoopGameMode.Archon;
         public static MultiFactionDefeatRule DefeatRule { get; private set; } = MultiFactionDefeatRule.AllBasesLost;
         public static MultiFactionSpawnMode SpawnMode { get; private set; } = MultiFactionSpawnMode.Separated;
@@ -754,9 +756,41 @@ namespace TABCoopMod.Sync
                 : CoopBalancePreset.Balanced);
         }
 
+        public static void SetBalanceEnhancementPlayers(int value)
+        {
+            if (!IsSessionActive || !Transport.IsHost) return;
+            int clamped = Math.Max(0, Math.Min(CoopLimits.MaxBalanceEnhancementPlayers, value));
+            if (clamped == 1) clamped = 2; // 1P enhancement is not a supported tier.
+            if (BalanceEnhancementPlayers == clamped) return;
+            BalanceEnhancementPlayers = clamped;
+            ModLogger.Info($"[CoopSessionManager] BalanceEnhancementPlayers changed to {clamped} (0=auto).");
+            BroadcastLobbyRoster();
+            LobbyStateChanged?.Invoke();
+        }
+
+        public static int GetEffectiveBalanceEnhancementPlayers()
+        {
+            int actual = GetEffectivePeers().Count;
+            if (actual < 2) return 0;
+            int effective = BalanceEnhancementPlayers > 0
+                ? BalanceEnhancementPlayers
+                : Math.Min(actual, CoopLimits.MaxBalanceEnhancementPlayers);
+            return Math.Max(2, Math.Min(CoopLimits.MaxBalanceEnhancementPlayers, effective));
+        }
+
         public static void SetGameMode(CoopGameMode mode)
         {
             if (!IsSessionActive || !Transport.IsHost) return;
+
+            if (mode == CoopGameMode.MultiFaction &&
+                GetEffectivePeers().Count > CoopLimits.MaxFactionPlayers)
+            {
+                GameBridge.ShowTopBanner(
+                    $"独立基地最多 {CoopLimits.MaxFactionPlayers} 人，已保持执政官模式",
+                    Color.Orange, 3500);
+                mode = CoopGameMode.Archon;
+            }
+
             if (GameMode == mode) return;
             GameMode = mode;
             ModLogger.Info($"[CoopSessionManager] GameMode changed to {mode}.");
@@ -900,6 +934,7 @@ namespace TABCoopMod.Sync
                 w.Write((byte)GameMode);
                 w.Write((byte)DefeatRule);
                 w.Write((byte)SpawnMode);
+                w.Write((byte)BalanceEnhancementPlayers);
             });
         }
 
@@ -916,7 +951,7 @@ namespace TABCoopMod.Sync
                 ? (INetworkTransport)CreateLanTransport(host: true, port: lanPort)
                 : CreateTransport(useLoopback);
             BindTransportEvents();
-            Transport.StartHost(3);
+            Transport.StartHost(CoopLimits.MaxPlayers);
 
             _lobbyRoster.Clear();
             if (Transport.ConnectedPeers != null)
@@ -934,6 +969,7 @@ namespace TABCoopMod.Sync
             }
             RoomPhase = LobbyRoomPhase.InLobby;
             BalancePreset = CoopBalancePreset.Balanced;
+            BalanceEnhancementPlayers = 0;
             GameMode = CoopGameMode.Archon;
             DefeatRule = MultiFactionDefeatRule.AllBasesLost;
             SpawnMode = MultiFactionSpawnMode.Separated;
@@ -963,6 +999,7 @@ namespace TABCoopMod.Sync
 
             RoomPhase = LobbyRoomPhase.InLobby;
             BalancePreset = CoopBalancePreset.Balanced;
+            BalanceEnhancementPlayers = 0;
             GameMode = CoopGameMode.Archon;
             DefeatRule = MultiFactionDefeatRule.AllBasesLost;
             SpawnMode = MultiFactionSpawnMode.Separated;
@@ -984,6 +1021,7 @@ namespace TABCoopMod.Sync
             IsInSyncedLevel = false;
             RoomPhase = LobbyRoomPhase.Idle;
             BalancePreset = CoopBalancePreset.Balanced;
+            BalanceEnhancementPlayers = 0;
             GameMode = CoopGameMode.Archon;
             DefeatRule = MultiFactionDefeatRule.AllBasesLost;
             SpawnMode = MultiFactionSpawnMode.Separated;
@@ -1230,6 +1268,15 @@ namespace TABCoopMod.Sync
                     }
                     BroadcastLobbyRoster();
 
+                    if (GameMode == CoopGameMode.MultiFaction &&
+                        _lobbyRoster.Count > CoopLimits.MaxFactionPlayers)
+                    {
+                        GameBridge.ShowTopBanner(
+                            $"房间超过 {CoopLimits.MaxFactionPlayers} 人，已自动切回执政官模式",
+                            Color.Orange, 3500);
+                        SetGameMode(CoopGameMode.Archon);
+                    }
+
                     // If Host is already inside a level when a peer connects, push snapshot immediately!
                     if (GameBridge.CurrentLevelState != null && !_hostSnapshotReloadPending)
                     {
@@ -1398,7 +1445,8 @@ namespace TABCoopMod.Sync
                 {
                     if (!FactionOwnershipTracker.IsInitialized)
                     {
-                        int pCount = Math.Max(1, GetEffectivePeers().Count);
+                        int pCount = Math.Max(1, Math.Min(
+                            CoopLimits.MaxFactionPlayers, GetEffectivePeers().Count));
                         FactionOwnershipTracker.EnsureExtraCommandCentersInLiveLevel(pCount);
                         FactionOwnershipTracker.AssignInitialOwnershipFromLevel(pCount);
                     }
@@ -2927,6 +2975,11 @@ namespace TABCoopMod.Sync
                     if (r.BaseStream.Position + 1 <= r.BaseStream.Length)
                     {
                         SpawnMode = (MultiFactionSpawnMode)r.ReadByte();
+                    }
+                    if (r.BaseStream.Position + 1 <= r.BaseStream.Length)
+                    {
+                        BalanceEnhancementPlayers = Math.Max(0, Math.Min(
+                            CoopLimits.MaxBalanceEnhancementPlayers, (int)r.ReadByte()));
                     }
                     Transport.SyncPeers(_lobbyRoster);
                     LobbyStateChanged?.Invoke();

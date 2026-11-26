@@ -87,7 +87,7 @@ namespace TABCoopMod.Networking
         event Action<byte> OnPeerDisconnected;
         event Action<string, string, string> OnVersionMismatch;
 
-        void StartHost(int maxPlayers = 3);
+        void StartHost(int maxPlayers = CoopLimits.MaxPlayers);
         void ConnectToHost(string targetAddressOrSteamId);
         void SendToPeer(byte targetPlayerId, SendChannel channel, PacketType type, Action<BinaryWriter> writePayload);
         void Broadcast(SendChannel channel, PacketType type, Action<BinaryWriter> writePayload);
@@ -109,7 +109,7 @@ namespace TABCoopMod.Networking
         private TcpClient _clientToHost;
         private NetworkStream _streamToHost;
         private readonly List<PeerInfo> _peers = new List<PeerInfo>();
-        private int _maxPlayers = 3;
+        private int _maxPlayers = CoopLimits.MaxPlayers;
 
         /// <summary>
         /// When true, this transport is used as a plain LAN TCP transport (bind 0.0.0.0 / join IP:port)
@@ -143,7 +143,7 @@ namespace TABCoopMod.Networking
         public event Action<byte> OnPeerDisconnected;
         public event Action<string, string, string> OnVersionMismatch;
 
-        public void StartHost(int maxPlayers = 3)
+        public void StartHost(int maxPlayers = CoopLimits.MaxPlayers)
         {
             Dispose();
             IsHost = true;

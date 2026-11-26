@@ -1,8 +1,8 @@
-# 21 — 6 人执政官模式支持规划（草案）
+# 21 — 6 人执政官模式支持规划（Phase A/B 已实施）
 
-> **状态**: 草案，等待确认后实施  
-> **分支**: `feat/6p-archon`  
-> **目标**: 自用版本，**执政官（Archon）模式支持最多 6 人**；最大人数通过**一处常量**即可修改；独立基地（Multi-Faction）仍限制 3 人。  
+> **状态**: Phase A/B 已实施，等待 6 槽 UI 与 4~6P 实机验证
+> **分支**: `feat/6p-archon`
+> **目标**: 自用版本，**执政官（Archon）模式支持最多 6 人**；最大人数通过**一处常量**即可修改；独立基地（Multi-Faction）仍限制 3 人。
 > **不在本次范围**: 4 人以上独立基地、4 人以上奇观众筹/多基地地图生成、Steam 创意工坊正式发布、官方兼容性承诺。
 
 ---
@@ -35,7 +35,7 @@
 
 ## 2. 设计原则
 
-1. **单点配置**：新增 `CoopLimits.MaxPlayers`，默认 `6`；改这一行即可变成 4/5/7 人（UI/传输自动跟随）。
+1. **单点配置**：新增 `CoopLimits.MaxPlayers`，默认 `6`；改这一行即可变成 4/5/6 人（UI/传输自动跟随）。7 人以上颜色会自动循环，但大厅布局还需要额外调整。
 2. **执政官优先**：>3 人只允许 Archon；Multi-Faction 上限保持 `3`。
 3. **不改确定性核心**：锁步、状态哈希、寻路、物理、RNG 隔离逻辑不动。
 4. **复用现有传输**：Steam P2P、LAN TCP、Loopback 都通过 `StartHost(maxPlayers)` 参数化。
@@ -164,25 +164,39 @@ public static class CoopLimits
 - 队友视野框、Ping、颜色：
   - 使用统一颜色表，避免 P4~P6 落到默认色。
 
-### 4.5 平衡预设
+### 4.5 平衡预设与“指定增强人数”
 
-- `Vanilla`（原版纯净）：
-  - 当前 `GetProfileForPlayerCount` 直接返回 `IsActive=false`，不扩图、不加感染者、不加波次。
-  - **>3 人推荐且默认使用该预设。**
-- `Balanced`（联机均衡）：
-  - 当前只有 2P/3P 档案。
-  - 建议 >3 人时二选一：
-    1. **禁用 Balanced**，强制 Vanilla（最简单、最稳）；
-    2. 暂时沿用 3P 档案，仅作为实验选项。
-  - 本规划推荐方案 1，避免 4~6 人扩图/加怪带来的不确定性。
+用户确认：**不要抛弃 Balanced，而是允许 6 人在大厅手动选择按 2 人或 3 人档位增强**，以避免 6 人扩图/加怪带来的性能压力。
+
+设计：
+
+- 新增一个独立于“实际联机人数”的**平衡增强人数**参数：
+  - `ActualPlayerCount`：当前房间实际人数（2~6）。
+  - `BalanceEnhancementPlayers`：用于地图/初始兵力/工人/野怪/波次缩放的“增强档位”（2 或 3；0=自动）。
+- 大厅增加下拉/选择：
+  - `平衡增强: 自动 / 2人 / 3人`
+  - `自动` 规则：实际人数 ≤3 时取实际人数；实际人数 >3 时取 **3人**（当前支持的最高档）。
+  - 6 人房可选 `2人` 或 `3人` 增强。
+- `CoopBalanceManager` 接口调整：
+  - `GetProfileForPlayerCount(int actualPlayers, CoopBalancePreset preset, int balanceEnhancementPlayers)`
+  - `Vanilla`：仍返回 `IsActive=false`，不扩图/不加怪。
+  - `Balanced`：使用 `effective = balanceEnhancementPlayers > 0 ? balanceEnhancementPlayers : Math.Min(actualPlayers, 3)` 生成 profile；地图尺寸、额外单位/工人、`EarlySwarmScale/LateSwarmScale`、野怪密度均按 `effective` 取值。
+  - profile 中保留 `ActualPlayerCount` 与 `BalanceScalePlayerCount` 两个字段，避免 UI/日志混淆。
+- 独立基地模式：
+  - 紫色/多基地仍限制 3 人；该模式下 `BalanceEnhancementPlayers` 强制等于实际人数，避免“3 人房只生成 2 个基地”的不一致。
+- 推荐：
+  - 6 人执政官默认 `3人增强`（比 2 人稍强，但远低于 6 人扩图）。
+  - 如果 6 人仍觉得压力大，可手动选 `2人增强`。
+  - 纯原版手感选 `Vanilla`。
 
 ### 4.6 性能与网络
 
+- **网络优先级**：本自用版以 **LAN TCP / SakuraFRP** 为主；Steam P2P 只保持参数化兼容，不做 6 人专项调优/重点验证。
 - **输入延迟**：`InputDelayTicks` 当前 `1..4`。6 人时可先保持，实测 `clientLag/tickLag` 后再决定是否扩到 `1..6`。
 - **反压阈值**：现有 `5t/6t/9t` 阈值按 2~3 人调过；6 人需观察慢机影响，必要时调整。
 - **快照扇出**：主机对每个客机分别发送 `.zxsav` 分片；6 人时上传总量约 5 份。开局/重同步时间会变长，需实测。
 - **LAN TCP 发送**：当前 `LocalTcpLoopbackTransport` 是主线程同步写；6 人 + 大存档时可能卡一下。若实测明显，再加后台发送队列（作为 Phase D 可选优化）。
-- **主机帧预算**：Vanilla 感染者数量下，主机 `[Perf] logic` 应保持 < 33ms；若接近上限，降低游戏倍速或减少玩家爆兵量。
+- **主机帧预算**：Vanilla 或低档增强下，主机 `[Perf] logic` 应保持 < 33ms；若接近上限，降低游戏倍速、选择更低增强档或减少玩家爆兵量。
 
 ---
 
@@ -196,11 +210,14 @@ public static class CoopLimits
 - `AllyOverlayRenderer` / 槽位颜色统一。
 - 构建 0 警告 0 错误。
 
-### Phase B — 模式约束与会话细节
+### Phase B — 模式约束、平衡增强与会话细节
 
 - >3 人禁用/回退 Multi-Faction。
 - `NetCommand` 多基地范围改为 `MaxFactionPlayers` 并加空判。
-- Balanced 在 >3 人下禁用或回退 Vanilla。
+- 实现“平衡增强人数”：
+  - 大厅选择 `自动 / 2人 / 3人`；
+  - `CoopBalanceManager` 增加 `BalanceEnhancementPlayers` 参数；
+  - profile 分离 `ActualPlayerCount` 与 `BalanceScalePlayerCount`。
 - 检查暂停/市长/结算/队友 UI 的 P4~P6 显示。
 
 ### Phase C — 自动化验证
@@ -260,12 +277,13 @@ public static class CoopLimits
 必须全部满足：
 
 1. 修改 `CoopLimits.MaxPlayers` 一行，可在 4/5/6 人之间切换，UI 和传输随之变化。
-2. 6P 执政官 + Vanilla：建房、加入、准备、开局、读档、暂停、建造、训练、市长、结算全流程可用。
+2. 6P 执政官（Vanilla 或 2/3 人增强）：建房、加入、准备、开局、读档、暂停、建造、训练、市长、结算全流程可用。
 3. 6P 连续运行 ≥10 分钟：`StateChecksum MATCH`、`0 DESYNC`、`0 ERROR`；允许偶发 `Auto-resync`，但需记录耗时。
 4. 2P/3P 现有回归全部通过，行为不变。
 5. Multi-Faction 在 >3 人时被阻止或自动回退 Archon。
 6. 6 个玩家颜色在大厅/小地图/色环一致且可区分。
-7. 主机帧耗在 Vanilla 感染者数量下保持可玩（目标 `logic < 33ms`，具体以实测为准）。
+7. 主机帧耗在 Vanilla 或低档增强下保持可玩（目标 `logic < 33ms`，具体以实测为准）。
+8. 若测试环境无法稳定开 6 个实例：至少完成 4/5 人自动化 + 6 人代码审查，最终以实玩反馈补齐。
 
 ---
 
@@ -275,20 +293,20 @@ public static class CoopLimits
 
 - **漏改硬编码 3**：P4~P6 可能出现“能进房但指令/UI 不生效”的静默问题。需要全局 grep + 6P 实测覆盖。
 - **大厅布局溢出**：6 槽位可能挤压 banner/chaos 面板，需要截图验收。
-- **Steam P2P / DirectFastPath 多 Peer**：现有实现主要按 3 人验证；6 人需实测；LAN TCP 路径相对简单。
+- **Steam P2P / DirectFastPath 多 Peer**：本自用版不重点支持；LAN TCP 路径已完成 6P 传输握手测试。
 - **最慢客机**：6 人锁步等待概率更高，表现为输入延迟/追帧，不一定是 CPU 问题。
 - **快照扇出**：6 人重同步/开局更慢。
-- **Balanced 预设**：>3 人扩图/加怪行为未验证；建议强制 Vanilla。
+- **6P 实机环境不足**：4/5 人可自动化验证；6 人最终以实际游玩反馈为准。
 
-### 8.2 需要确认的问题
+### 8.2 已确认决策
 
-1. **>3 人是否只允许执政官？** 推荐：是，Multi-Faction 上限保持 3。
-2. **>3 人是否强制 Vanilla？** 推荐：是，避免 Balanced 扩图/加怪的不确定性。
-3. **玩家颜色**：P4 紫 / P5 金 / P6 品红是否可接受？可调整。
-4. **Steam P2P 6 人是否需要重点支持？** 还是以 LAN / SakuraFRP 为主，Steam 只保证参数化？
-5. **大厅布局**：紧凑 6 槽 vs 2 列 × 3 行？推荐先做紧凑 6 槽，截图后再定。
-6. **现有未提交的 LAN 改动**：当前 `feat/6p-archon` 分支工作区已包含局域网 TCP 改动（未提交）。实施 6P 前是否先把它作为一个基线提交，还是继续混在同一分支？
-7. **验收人数**：先按 6 人做；是否也要验证 4 人、5 人，还是只测 6 人即可？
+1. **>3 人只允许执政官**：Multi-Faction 上限保持 3；超过自动回退。
+2. **保留 Balanced，支持指定增强人数**：6 人房可选 `自动 / 2人增强 / 3人增强`；地图、初始兵力、工人、野怪、波次按增强档位计算，实际人数独立。
+3. **玩家颜色**：P1 蓝 / P2 绿 / P3 橙 / P4 紫 / P5 金 / P6 品红。
+4. **Steam P2P 不重点支持**：只保持参数化兼容，主测 LAN / SakuraFRP。
+5. **大厅采用紧凑 6 槽**：先压缩槽高；不够再改 2 列。
+6. **LAN 改动已提交**：`master` 与 `feat/6p-archon` 都包含 LAN TCP 提交。
+7. **验收人数**：优先 6 人；4/5 人顺带验证；6 人无环境时以代码审查 + 实玩反馈补齐。
 
 ---
 
@@ -300,13 +318,31 @@ public static class CoopLimits
 
 ---
 
-## 10. 预计工作量
+## 10. 实施进度
 
-- Phase A（常量 + 传输 + 6 人大厅 + 颜色）：约半天。
-- Phase B（模式约束 + 会话细节）：约半天。
-- Phase C（6P 自动化 + 实测 + 调优）：约 1 天，取决于机器数量与实测轮次。
-- 总计：约 **2 天**（不含长时间稳定性压测）。
+### 已完成（2026-11-26）
+
+- **Phase A**
+  - 新增 `Core/CoopLimits.cs`：`MaxPlayers = 6`、`MaxFactionPlayers = 3`、6 色玩家调色板。
+  - 传输层默认值与 `StartHostSession` 改为 `CoopLimits.MaxPlayers`。
+  - 大厅 6 槽位、紧凑布局、动态颜色；本地/Steam 房间文本同步人数。
+- **Phase B**
+  - >3 人自动阻止/回退 Multi-Faction。
+  - 新增“平衡增强档位”：`自动 / 2人 / 3人`，通过 `LobbyRosterSync` 同步。
+  - `CoopBalanceManager` profile 分离 `ActualPlayerCount` 与 `BalanceScalePlayerCount`。
+  - `NetCommand` 多基地上下文范围改为 `MaxFactionPlayers`。
+- **验证**
+  - Release 构建：**0 警告 0 错误**。
+  - 6P LAN TCP 握手测试：Host + 5 Client，`P2..P6` 全部分配成功。
+  - 平衡 profile 反射测试：6P + 3人增强 → `NCells=304 / scale=3`；6P + 2人增强 → `NCells=280 / scale=2`；6P Vanilla → inactive。
+
+### 待完成
+
+- 大厅 6 槽 UI 截图验收（需要实机/多实例）。
+- 4P/5P/6P 实机 Loopback / LAN 全流程（准备、开局、读档、暂停、建造、市长、结算）。
+- 长时间 `StateChecksum` / 重同步 / 帧耗采集。
+- 可选：6P 快照扇出优化、LAN TCP 后台发送队列。
 
 ---
 
-**下一步**：请确认第 8.2 节的 7 个问题；确认后按 Phase A → B → C 实施。
+**下一步**：实机验证 6 槽 UI 与 4~6P 联机流程；发现问题再进入 Phase C/D。

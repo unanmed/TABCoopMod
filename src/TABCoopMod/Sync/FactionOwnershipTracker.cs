@@ -64,13 +64,7 @@ namespace TABCoopMod.Sync
 
         public static Color GetPlayerColor(byte playerId)
         {
-            switch (playerId)
-            {
-                case 1: return Color.DodgerBlue;
-                case 2: return Color.SpringGreen;
-                case 3: return Color.Orange;
-                default: return Color.White;
-            }
+            return CoopLimits.GetPlayerColor(playerId);
         }
 
         public static int TrackedEntityCount

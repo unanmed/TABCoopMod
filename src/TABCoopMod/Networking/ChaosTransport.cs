@@ -194,7 +194,7 @@ namespace TABCoopMod.Networking
         public event Action<byte> OnPeerDisconnected;
         public event Action<string, string, string> OnVersionMismatch;
 
-        public void StartHost(int maxPlayers = 3) => _inner.StartHost(maxPlayers);
+        public void StartHost(int maxPlayers = CoopLimits.MaxPlayers) => _inner.StartHost(maxPlayers);
         public void ConnectToHost(string targetAddressOrSteamId) => _inner.ConnectToHost(targetAddressOrSteamId);
 
         public void SendToPeer(byte targetPlayerId, SendChannel channel, PacketType type, Action<BinaryWriter> writePayload)

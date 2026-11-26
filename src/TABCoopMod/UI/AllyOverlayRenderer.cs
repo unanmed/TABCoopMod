@@ -106,13 +106,7 @@ namespace TABCoopMod.UI
 
         public static Color GetPlayerColor(byte playerId)
         {
-            switch (playerId)
-            {
-                case 1: return Color.DodgerBlue;
-                case 2: return Color.SpringGreen;
-                case 3: return Color.Orange;
-                default: return Color.Cyan;
-            }
+            return CoopLimits.GetPlayerColor(playerId);
         }
 
         public static void TriggerMinimapAndGroundPing(byte playerId, Point cell, string label)
