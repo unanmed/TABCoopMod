@@ -10,7 +10,7 @@ namespace TABCoopMod.Core
     /// </summary>
     public static class ModInfo
     {
-        public const string Version = "0.2.8";
+        public const string Version = "0.2.8-6p";
         public const string Tag = "v" + Version;
         public const string AssemblyVersion = "0.2.8.0";
 
