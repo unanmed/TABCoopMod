@@ -44,6 +44,7 @@ namespace TABCoopMod.Networking
         PosDriftStatsReport = 0x33,
         StateChecksumDetailRequest = 0x34,
         StateChecksumDetailResponse = 0x35,
+        ManualResyncRequest = 0x36,
         AllyCursorAndCamera = 0x40,
         TacticalPing = 0x41,
         RttPing = 0x42,

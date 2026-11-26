@@ -1049,6 +1049,7 @@ namespace TABCoopMod.Sync
             _hostSymmetricQueue.Clear();
             _pendingTurnCommands.Clear();
             UI.MultiFactionPanel.Reset();
+            UI.ManualSyncButton.Reset();
             UI.AllyOverlayRenderer.ClearUnitFactionRings();
             _hostLastBroadcastSimTick = -1;
             _hostLastBroadcastTargetTick = -1;
@@ -1131,6 +1132,7 @@ namespace TABCoopMod.Sync
             _hostSymmetricQueue.Clear();
             _pendingTurnCommands.Clear();
             UI.MultiFactionPanel.Reset();
+            UI.ManualSyncButton.Reset();
             UI.AllyOverlayRenderer.ClearUnitFactionRings();
             _hostLastBroadcastSimTick = -1;
             _hostLastBroadcastTargetTick = -1;
@@ -1394,6 +1396,43 @@ namespace TABCoopMod.Sync
             if (Transport == null || !Transport.IsHost || GameBridge.CurrentLevelState == null)
                 return;
             _pendingHostSnapshotExport = true;
+        }
+
+        /// <summary>
+        /// Manual resync requested from the in-game button / F9.
+        /// Host: export and broadcast a fresh snapshot. Client: ask the Host to do it.
+        /// </summary>
+        public static bool RequestManualResync()
+        {
+            if (!IsSessionActive || !IsInSyncedLevel || Transport == null)
+                return false;
+
+            if (LockstepClock.LoadingLevel || GameBridge.IsGameLoading())
+            {
+                GameBridge.ShowTopBanner("正在加载，暂时无法手动同步", Color.Orange, 1600);
+                return false;
+            }
+
+            if (Transport.IsHost)
+            {
+                if (_pendingHostSnapshotExport || _awaitingClientSnapshotAck)
+                {
+                    GameBridge.ShowTopBanner("同步已在进行中...", Color.Gold, 1600);
+                    return false;
+                }
+
+                _lastAutoResyncTicks = DXHelper_Environment.Ticks;
+                ResetTieredResyncState();
+                ModLogger.WarnImmediate("[CoopSessionManager] Manual resync requested by Host.");
+                GameBridge.ShowTopBanner("手动同步：正在导出并广播快照...", Color.Cyan, 3000);
+                RequestSnapshotBroadcast();
+                return true;
+            }
+
+            ModLogger.Info("[CoopSessionManager] Manual resync requested by Client; asking Host.");
+            Transport.SendToPeer(1, SendChannel.ReliableCommand, PacketType.ManualResyncRequest, _ => { });
+            GameBridge.ShowTopBanner("已请求房主手动同步...", Color.Cyan, 2200);
+            return true;
         }
 
         /// <summary>
@@ -2137,6 +2176,7 @@ namespace TABCoopMod.Sync
 
             CoopLobbyWindow.Tick();
             UI.MultiFactionPanel.Tick();
+            UI.ManualSyncButton.Tick();
             UI.AllyOverlayRenderer.UpdateUnitFactionRings();
 
             if (!string.IsNullOrEmpty(_pendingVersionMismatchAlert)
@@ -3243,6 +3283,24 @@ namespace TABCoopMod.Sync
                     if (!Transport.IsHost) break;
                     MergeStage2DetailResponse(r, out int mergedTick, senderId);
                     VerifyTickChecksum(mergedTick);
+                    break;
+                }
+
+                case PacketType.ManualResyncRequest:
+                {
+                    if (!Transport.IsHost) break;
+                    if (LockstepClock.LoadingLevel || GameBridge.IsGameLoading()
+                        || _pendingHostSnapshotExport || _awaitingClientSnapshotAck)
+                    {
+                        GameBridge.ShowTopBanner("同步已在进行中...", Color.Gold, 1600);
+                        break;
+                    }
+
+                    _lastAutoResyncTicks = DXHelper_Environment.Ticks;
+                    ResetTieredResyncState();
+                    ModLogger.WarnImmediate($"[CoopSessionManager] Manual resync requested by Client P{senderId}.");
+                    GameBridge.ShowTopBanner($"P{senderId} 请求手动同步，正在导出快照...", Color.Cyan, 3000);
+                    RequestSnapshotBroadcast();
                     break;
                 }
 

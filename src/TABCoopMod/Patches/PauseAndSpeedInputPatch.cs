@@ -59,6 +59,17 @@ namespace TABCoopMod.Patches
             [HarmonyPrefix]
             public static bool Prefix(DXKeys __0, ref bool __result)
             {
+                if (__0 == DXKeys.F9
+                    && CoopSessionManager.IsSessionActive
+                    && CoopSessionManager.IsInSyncedLevel
+                    && !LockstepClock.LoadingLevel
+                    && !DXModalScreen.IsInModal)
+                {
+                    CoopSessionManager.RequestManualResync();
+                    __result = true;
+                    return false;
+                }
+
                 if (__0 == DXKeys.F7
                     && CoopSessionManager.IsMultiFactionActive
                     && CoopSessionManager.IsInSyncedLevel
