@@ -280,7 +280,30 @@ namespace TABCoopMod.Networking
 
             try
             {
-                _clientToHost = ConnectTcpFastest(host, port, timeoutMs, out string connectedAddress);
+                bool useLegacyConnect = string.Equals(
+                    Environment.GetEnvironmentVariable("TABCOOP_LEGACY_CONNECT"),
+                    "1",
+                    StringComparison.OrdinalIgnoreCase);
+                string connectedAddress = string.Empty;
+
+                if (useLegacyConnect)
+                {
+                    ModLogger.Info("[LAN DEBUG] TABCOOP_LEGACY_CONNECT=1; using legacy TcpClient.BeginConnect(host, port).");
+                    _clientToHost = ConnectTcpLegacy(host, port, timeoutMs, out connectedAddress);
+                }
+                else
+                {
+                    try
+                    {
+                        _clientToHost = ConnectTcpFastest(host, port, timeoutMs, out connectedAddress);
+                    }
+                    catch (Exception fastEx)
+                    {
+                        ModLogger.Warn($"[LAN DEBUG] Fastest connect failed; falling back to legacy TcpClient.BeginConnect(host, port): {fastEx}");
+                        _clientToHost = ConnectTcpLegacy(host, port, timeoutMs, out connectedAddress);
+                    }
+                }
+
                 ConnectedRemoteAddress = connectedAddress;
             }
             catch
@@ -654,6 +677,44 @@ namespace TABCoopMod.Networking
 
             ModLogger.Info($"[LAN DEBUG] Connected via {connectedAddress}:{port}; resolved=[{string.Join(", ", resolved)}]");
             return winner;
+        }
+
+        /// <summary>
+        /// cc5e46f-compatible connection path: let TcpClient resolve the hostname and
+        /// open exactly one connection, without the multi-address parallel logic.
+        /// Kept as a compatibility fallback for launchers/network stacks that reject
+        /// the newer multi-socket path.
+        /// </summary>
+        private static TcpClient ConnectTcpLegacy(string host, int port, int timeoutMs, out string connectedAddress)
+        {
+            connectedAddress = string.Empty;
+            var client = new TcpClient { NoDelay = true };
+            try
+            {
+                var iar = client.BeginConnect(host, port, null, null);
+                if (!iar.AsyncWaitHandle.WaitOne(timeoutMs))
+                {
+                    try { client.Close(); } catch { }
+                    throw new TimeoutException($"连接 {host}:{port} 超时（{timeoutMs}ms）。");
+                }
+
+                client.EndConnect(iar);
+                try
+                {
+                    connectedAddress = client.Client?.RemoteEndPoint?.ToString() ?? host;
+                }
+                catch
+                {
+                    connectedAddress = host;
+                }
+                ModLogger.Info($"[LAN DEBUG] Legacy connect succeeded to {host}:{port} ({connectedAddress}).");
+                return client;
+            }
+            catch
+            {
+                try { client.Close(); } catch { }
+                throw;
+            }
         }
 
         private static bool IsLoopbackOrPrivateAddress(string host)
