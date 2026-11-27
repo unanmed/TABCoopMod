@@ -53,7 +53,7 @@ $configXml = @"
     <supportedRuntime version="v4.0" sku=".NETFramework,Version=v4.6"/>
   </startup>
   <runtime>
-    <appDomainManagerAssembly value="TABCoopMod, Version=0.2.12.0, Culture=neutral, PublicKeyToken=null" />
+    <appDomainManagerAssembly value="TABCoopMod, Version=0.2.14.0, Culture=neutral, PublicKeyToken=null" />
     <appDomainManagerType value="TABCoopMod.Bootstrap.ModAppDomainManager" />
   </runtime>
 </configuration>

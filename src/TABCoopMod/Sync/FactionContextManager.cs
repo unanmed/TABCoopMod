@@ -35,6 +35,8 @@ namespace TABCoopMod.Sync
             public int OwnEnergyNeeded;
             public int TestExtraStorage;
             public int TestExtraWorkers;
+            public int TestExtraFood;
+            public int TestExtraEnergy;
             public int TestExtraColonists;
             public bool ShowFullMap;
             public Dictionary<ulong, int> BonusEntityTemplates = new Dictionary<ulong, int>();
@@ -49,6 +51,8 @@ namespace TABCoopMod.Sync
                     OwnEnergyNeeded = OwnEnergyNeeded,
                     TestExtraStorage = TestExtraStorage,
                     TestExtraWorkers = TestExtraWorkers,
+                    TestExtraFood = TestExtraFood,
+                    TestExtraEnergy = TestExtraEnergy,
                     TestExtraColonists = TestExtraColonists,
                     BonusEntityTemplates = new Dictionary<ulong, int>(BonusEntityTemplates),
                     OnlyOneExecutedCommands = new Dictionary<int, int>(OnlyOneExecutedCommands)
@@ -118,7 +122,7 @@ namespace TABCoopMod.Sync
         public static bool AnyAlivePlayerHasMarket()
         {
             if (!IsInitialized) return (GameBridge.ReadRawLevelEconomyState(out var s) && s.NMarkets > 0);
-            int maxP = Math.Max(1, Math.Min(3, (int)FactionOwnershipTracker.ActivePlayerCount));
+            const int maxP = 3;
             for (byte p = 1; p <= maxP; p++)
             {
                 if (FactionOwnershipTracker.IsExiled(p)) continue;
@@ -155,8 +159,27 @@ namespace TABCoopMod.Sync
             var baseBonus = GameBridge.GetLevelBonusTemplatesDict() ?? new Dictionary<ulong, int>();
             var baseTechs = GameBridge.GetLevelOnlyOneCommandsDict() ?? new Dictionary<int, int>();
 
+            byte[] slots = FactionOwnershipTracker.GetParticipatingSlotsSorted();
+            byte firstSlot = (slots != null && slots.Length > 0) ? slots[0] : (byte)1;
+            var activeSlots = new HashSet<byte>();
+            if (slots != null)
+            {
+                for (int i = 0; i < slots.Length; i++)
+                    activeSlots.Add(slots[i]);
+            }
+            if (activeSlots.Count == 0)
+            {
+                for (byte p = 1; p <= count; p++)
+                    activeSlots.Add(p);
+            }
+
             for (byte p = 1; p <= 3; p++)
             {
+                if (!activeSlots.Contains(p))
+                {
+                    _factions[p] = null;
+                    continue;
+                }
                 _factions[p] = new FactionLedger
                 {
                     Economy = baseEcon,
@@ -164,8 +187,8 @@ namespace TABCoopMod.Sync
                     OwnEnergyNeeded = baseEcon.EnergyNeeded,
                     ShowFullMap = GameBridge.GetLevelStateShowFullMap(),
                     // Starter match starts with symmetric starting stock & unlocked commands;
-                    // mid-game saves with Mayor bonuses keep gifts only on P1 so bonuses aren't duplicated.
-                    BonusEntityTemplates = p == 1 ? new Dictionary<ulong, int>(baseBonus) : new Dictionary<ulong, int>(),
+                    // mid-game saves with Mayor bonuses keep gifts only on the first active slot so bonuses aren't duplicated.
+                    BonusEntityTemplates = p == firstSlot ? new Dictionary<ulong, int>(baseBonus) : new Dictionary<ulong, int>(),
                     OnlyOneExecutedCommands = new Dictionary<int, int>(baseTechs)
                 };
             }
@@ -197,10 +220,21 @@ namespace TABCoopMod.Sync
             RecalculateAllFactions();
         }
 
+        private static void EnsureSimIdleOnMainThread()
+        {
+            if (!Determinism.DeterministicSandboxPatches.IsAsyncTickInFlight)
+                return;
+            int mainId = Determinism.LockstepClock.MainThreadId;
+            int curId = System.Threading.Thread.CurrentThread.ManagedThreadId;
+            if (mainId != 0 && curId == mainId && Determinism.LockstepClock.LogicThreadId != curId)
+                Determinism.DeterministicSandboxPatches.FlushPendingAsyncTick(DXGame.Current);
+        }
+
         public static void PushContext(byte playerId)
         {
             if (!CoopSessionManager.IsMultiFactionActive || !IsInitialized)
                 return;
+            EnsureSimIdleOnMainThread();
             if (playerId < 1 || playerId > 3)
                 playerId = 1;
 
@@ -217,6 +251,9 @@ namespace TABCoopMod.Sync
         public static void PopContext()
         {
             if (!CoopSessionManager.IsMultiFactionActive || !IsInitialized || _contextStack.Count == 0)
+                return;
+            EnsureSimIdleOnMainThread();
+            if (_contextStack.Count == 0)
                 return;
 
             _contextStack.Pop();
@@ -377,7 +414,7 @@ namespace TABCoopMod.Sync
             }
             if (allUnits.Count > 1)
                 allUnits.Sort(GameBridge.CompareEntitiesDeterministically);
-            int maxP = Math.Max(1, Math.Min(3, (int)FactionOwnershipTracker.ActivePlayerCount));
+            const int maxP = 3;
             var enhancersByOwner = new List<DXEntity>[4];
             for (byte pid = 1; pid <= maxP; pid++)
                 enhancersByOwner[pid] = new List<DXEntity>(8);
@@ -513,6 +550,8 @@ namespace TABCoopMod.Sync
 
                 e.ResourceStorage = Math.Max(50, e.ResourceStorage + ledger.TestExtraStorage);
                 e.WorkersSupply += ledger.TestExtraWorkers;
+                e.FoodSupply += ledger.TestExtraFood;
+                e.EnergySupply += ledger.TestExtraEnergy;
                 e.Colonists += ledger.TestExtraColonists;
 
                 int armyFoodPen = 0;
@@ -715,11 +754,11 @@ namespace TABCoopMod.Sync
         {
             if (gold <= 0 || !IsInitialized) return;
             FlushActiveOwnerFromLevelState();
-            int maxP = Math.Max(1, Math.Min(3, (int)FactionOwnershipTracker.ActivePlayerCount));
+            const int maxP = 3;
             var alive = new List<byte>(3);
             for (byte p = 1; p <= maxP; p++)
             {
-                if (!FactionOwnershipTracker.IsExiled(p) && _factions[p] != null)
+                if (!FactionOwnershipTracker.IsExiled(p) && FactionOwnershipTracker.IsSlotParticipating(p) && _factions[p] != null)
                     alive.Add(p);
             }
             if (alive.Count == 0) return;
@@ -821,7 +860,7 @@ namespace TABCoopMod.Sync
             }
         }
 
-        public static void AdjustResourcesForTesting(byte pid, int gold, int wood, int stone, int iron, int oil, int extraStorage = 0, int extraWorkers = 0, int extraColonists = 0)
+        public static void AdjustResourcesForTesting(byte pid, int gold, int wood, int stone, int iron, int oil, int extraStorage = 0, int extraWorkers = 0, int extraColonists = 0, int extraFood = 0, int extraEnergy = 0)
         {
             if (!IsInitialized || pid < 1 || pid > 3) return;
             FlushActiveOwnerFromLevelState();
@@ -837,6 +876,16 @@ namespace TABCoopMod.Sync
                 {
                     l.TestExtraWorkers = Math.Max(0, l.TestExtraWorkers + extraWorkers);
                     l.Economy.WorkersSupply += extraWorkers;
+                }
+                if (extraFood != 0)
+                {
+                    l.TestExtraFood = Math.Max(0, l.TestExtraFood + extraFood);
+                    l.Economy.FoodSupply += extraFood;
+                }
+                if (extraEnergy != 0)
+                {
+                    l.TestExtraEnergy = Math.Max(0, l.TestExtraEnergy + extraEnergy);
+                    l.Economy.EnergySupply += extraEnergy;
                 }
                 if (extraColonists != 0)
                 {
@@ -864,7 +913,7 @@ namespace TABCoopMod.Sync
         {
             if (commandId == 0 || !IsInitialized) return;
             FlushActiveOwnerFromLevelState();
-            int maxP = Math.Max(1, Math.Min(3, (int)FactionOwnershipTracker.ActivePlayerCount));
+            const int maxP = 3;
             for (byte p = 1; p <= maxP; p++)
             {
                 if (FactionOwnershipTracker.IsExiled(p)) continue;
@@ -940,7 +989,7 @@ namespace TABCoopMod.Sync
                 w.Write(e.Colonists); w.Write(e.GoldByCc); w.Write(e.TotalStock);
                 w.Write(e.WoodProd); w.Write(e.StoneProd); w.Write(e.IronProd); w.Write(e.OilProd); w.Write(e.GoldProd);
                 w.Write(e.NMarkets); w.Write(e.MaxGoldExport); w.Write(e.ArmyGold); w.Write(e.ArmyFoodPen); w.Write(e.StructGold); w.Write(e.GoldPerColonist);
-                w.Write(l.OwnEnergySupply); w.Write(l.OwnEnergyNeeded); w.Write(l.TestExtraStorage); w.Write(l.TestExtraWorkers); w.Write(l.ShowFullMap);
+                w.Write(l.OwnEnergySupply); w.Write(l.OwnEnergyNeeded); w.Write(l.TestExtraStorage); w.Write(l.TestExtraWorkers); w.Write(l.TestExtraFood); w.Write(l.TestExtraEnergy); w.Write(l.ShowFullMap);
 
                 w.Write(l.BonusEntityTemplates.Count);
                 foreach (var kv in l.BonusEntityTemplates.OrderBy(k => k.Key))
@@ -983,6 +1032,8 @@ namespace TABCoopMod.Sync
                 l.OwnEnergySupply = r.ReadInt32(); l.OwnEnergyNeeded = r.ReadInt32();
                 l.TestExtraStorage = r.ReadInt32();
                 l.TestExtraWorkers = r.ReadInt32();
+                l.TestExtraFood = r.ReadInt32();
+                l.TestExtraEnergy = r.ReadInt32();
                 l.ShowFullMap = r.ReadBoolean();
                 l.Economy = e;
 
@@ -1006,9 +1057,10 @@ namespace TABCoopMod.Sync
             ulong h = 0x517CC1B727220A95UL;
             h = Mix(h, ZeroTransferFeeActive ? 1UL : 0UL);
             h = Mix(h, SharedEnergyGridActive ? 1UL : 0UL);
-            int maxP = Math.Max(1, Math.Min(3, (int)FactionOwnershipTracker.ActivePlayerCount));
+            const int maxP = 3;
             for (byte p = 1; p <= maxP; p++)
             {
+                if (!FactionOwnershipTracker.IsSlotParticipating(p)) continue;
                 var l = _factions[p];
                 if (l == null) continue;
                 var e = l.Economy;

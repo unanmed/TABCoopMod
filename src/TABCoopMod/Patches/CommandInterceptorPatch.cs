@@ -356,6 +356,8 @@ namespace TABCoopMod.Patches
             string extraTypeOrSlotTag = string.Empty;
             byte extraSlotIndex = 0;
             bool isBonusUnit = false;
+            bool isMercenary = false;
+            Type resolvedOrderEntityType = null;
             if (GameBridge.TryGetEntityBonusInfo(__instance, out int bonusUnitSlot, out Type bonusEntityType, out bool bonusIsStructure, out _)
                 && !bonusIsStructure)
             {
@@ -365,11 +367,25 @@ namespace TABCoopMod.Patches
                 extraTypeOrSlotTag = bonusEntityType.FullName;
                 extraSlotIndex = (byte)Math.Max(0, Math.Min(255, bonusUnitSlot));
                 isBonusUnit = true;
+                resolvedOrderEntityType = bonusEntityType;
             }
             else if (GameBridge.TryGetExtractSlotInfo(__instance, out int extractSlot))
             {
                 extraTypeOrSlotTag = "ZX.Commands.ExtractFromUnitHolderSlot";
                 extraSlotIndex = (byte)Math.Max(0, Math.Min(255, extractSlot));
+            }
+            else if (GameBridge.TryGetContractMercenaryInfo(__instance, executor, out int mercSlot, out Type mercEntityType, out _, out int innMercCount))
+            {
+                // Empty, uninitialized (NSlot<=0), or stale mercenary slot — ignore safely with diagnostics.
+                if (mercSlot <= 0 || mercEntityType == null)
+                {
+                    ModLogger.Info($"[CommandInterceptor] Ignored ContractMercenary slot={mercSlot} on {executor.ID}: innMercCount={innMercCount}, entityType={mercEntityType?.Name ?? "null"}.");
+                    return false;
+                }
+                extraTypeOrSlotTag = $"ZX.Commands.ContractMercenary|{mercEntityType.FullName}";
+                extraSlotIndex = (byte)Math.Max(0, Math.Min(255, mercSlot));
+                isMercenary = true;
+                resolvedOrderEntityType = mercEntityType;
             }
 
             var netCmd = new NetCommand
@@ -391,9 +407,9 @@ namespace TABCoopMod.Patches
             if (targetPos != PointF.Empty)
                 GameBridge.ShowGroundIndicatorForCommand(__instance, targetPos, targetEntityId != 0UL ? 0.6f : 1f);
 
-            Type orderEntityType = GameBridge.GetBuildingTypeFromCommand(__instance);
+            Type orderEntityType = resolvedOrderEntityType ?? GameBridge.GetBuildingTypeFromCommand(__instance);
             if (orderEntityType != null)
-                GameBridge.PlayLocalBuildOrOrderFeedback(orderEntityType, preferCreationSound: isBonusUnit, fallbackExecutor: executor);
+                GameBridge.PlayLocalBuildOrOrderFeedback(orderEntityType, preferCreationSound: isBonusUnit || isMercenary, fallbackExecutor: executor);
             else
                 GameBridge.PlayUnitCommandVoice(executor, GameBridge.IsAttackCommand(__instance));
 
@@ -534,6 +550,11 @@ namespace TABCoopMod.Patches
         {
             CommandInterceptor.SuppressIndividualMoveExecution = false;
             CommandInterceptor.InQueueAutoAdvance = false;
+            if (CommandExecutor.ConsumePendingCommandPanelRefresh()
+                && GameBridge.GetPendingCommandOnLevelSys() == null)
+            {
+                GameBridge.RefreshCommandPanel();
+            }
         }
     }
 

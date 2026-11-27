@@ -563,11 +563,14 @@ namespace TABCoopMod.Patches
             var game = DXGame.Current;
             if (game == null || entType == null) return 0;
             int count = 0;
-            foreach (var ent in game.EntitiesOfType(entType))
+            lock (DXGame.SyncLogic)
             {
-                if (ent == null || ent.Disposed) continue;
-                if (FactionOwnershipTracker.GetOwner(ent.ID) == owner)
-                    count++;
+                foreach (var ent in game.EntitiesOfType(entType))
+                {
+                    if (ent == null || ent.Disposed) continue;
+                    if (FactionOwnershipTracker.GetOwner(ent.ID) == owner)
+                        count++;
+                }
             }
             return count;
         }
@@ -576,11 +579,14 @@ namespace TABCoopMod.Patches
         {
             var game = DXGame.Current;
             if (game == null || entType == null) return false;
-            foreach (var ent in game.EntitiesOfType(entType))
+            lock (DXGame.SyncLogic)
             {
-                if (ent == null || ent.Disposed) continue;
-                if (FactionOwnershipTracker.GetOwner(ent.ID) == owner && GameBridge.IsEntityEnabled(ent))
-                    return true;
+                foreach (var ent in game.EntitiesOfType(entType))
+                {
+                    if (ent == null || ent.Disposed) continue;
+                    if (FactionOwnershipTracker.GetOwner(ent.ID) == owner && GameBridge.IsEntityEnabled(ent))
+                        return true;
+                }
             }
             return false;
         }
@@ -1351,6 +1357,37 @@ namespace TABCoopMod.Patches
             byte owner = FactionOwnershipTracker.GetOwner(__instance.ID);
             if (owner >= 1 && owner <= 3)
                 __result = FactionOwnershipTracker.GetPlayerColor(owner);
+        }
+    }
+
+    /// <summary>
+    /// Ensures every vanilla manual/autosave/save-and-exit flow (ZXGame.SaveGameFlow) persists the latest
+    /// Multi-Faction ownership map, ledgers, Wonder state, and map metadata into ZXLevelState.ScriptVariables
+    /// right before ZipSerializer writes the .zxsav archive.
+    /// </summary>
+    [HarmonyPatch]
+    public static class Patch_ZXGame_SaveGameFlow_MultiFaction
+    {
+        public static MethodBase TargetMethod()
+        {
+            return GameBridge.TypeZXGame != null
+                ? AccessTools.Method(
+                    GameBridge.TypeZXGame,
+                    ObfuscatedSymbols.Method_ZXGame_SaveGameFlow,
+                    new[] { typeof(string), typeof(Action), typeof(bool), typeof(bool) })
+                : null;
+        }
+
+        [HarmonyPrefix]
+        public static void Prefix(bool __2)
+        {
+            // confirmModal == false means actual save execution is running now.
+            if (__2) return;
+            if ((CoopSessionManager.IsMultiFactionActive || FactionOwnershipTracker.IsInitialized)
+                && GameBridge.CurrentLevelState != null)
+            {
+                FactionOwnershipTracker.SaveToLevelScriptVariables();
+            }
         }
     }
 }

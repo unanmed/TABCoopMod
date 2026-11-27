@@ -139,6 +139,7 @@ namespace TABCoopMod.Patches
             {
                 if (!CoopSessionManager.IsSessionActive || !CoopSessionManager.IsInSyncedLevel) return true;
                 if (LockstepClock.LoadingLevel || GameBridge.IsLevelEnded()) return true;
+                if (CoopSessionManager.ConsumeDirectGameMenuBypass()) return true;
                 if (DXModalScreen.IsInModal)
                 {
                     CoopSessionManager.CancelPendingGameMenuOpen();
@@ -156,6 +157,17 @@ namespace TABCoopMod.Patches
                 // Apply a synchronized pause, then open the menu on a later frame.
                 CoopSessionManager.RequestOpenGameMenuAfterPause();
                 return false;
+            }
+
+            [HarmonyPostfix]
+            public static void Postfix()
+            {
+                if (CoopSessionManager.IsSessionActive
+                    && CoopSessionManager.IsInSyncedLevel
+                    && DXModalScreen.IsInModal)
+                {
+                    CoopSessionManager.NotifyCoopGameMenuOpened();
+                }
             }
         }
 

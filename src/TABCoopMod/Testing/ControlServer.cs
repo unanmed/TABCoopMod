@@ -7,6 +7,7 @@ using System.Globalization;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
+using System.Reflection;
 using System.Text;
 using System.Threading;
 using System.Web.Script.Serialization;
@@ -248,6 +249,12 @@ namespace TABCoopMod.Testing
                     return TriggerFinalSwarmTool();
                 case "save_game":
                     return SaveGameTool(args);
+                case "get_inn_slots":
+                    return GetInnSlotsInfo(args);
+                case "invoke_inn_slot":
+                    return InvokeInnSlot(args);
+                case "force_place_building":
+                    return ForcePlaceBuilding(args);
                 default: throw new InvalidOperationException($"unknown tool '{tool}'");
             }
         }
@@ -705,6 +712,7 @@ namespace TABCoopMod.Testing
             {
                 case "move_units":
                 case "place_building":
+                case "force_place_building":
                 case "train_unit":
                 case "cancel_current_order":
                 case "cancel_queued_order":
@@ -729,6 +737,7 @@ namespace TABCoopMod.Testing
                 peers.Add(new Dictionary<string, object>
                 {
                     ["id"] = p.PlayerId,
+                    ["factionSlot"] = p.EffectiveFactionSlot,
                     ["name"] = p.PlayerName,
                     ["ready"] = p.IsReady
                 });
@@ -759,6 +768,11 @@ namespace TABCoopMod.Testing
                 ["sessionActive"] = Sync.CoopSessionManager.IsSessionActive,
                 ["isHost"] = Sync.CoopSessionManager.Transport?.IsHost ?? false,
                 ["localPlayerId"] = Sync.CoopSessionManager.Transport?.LocalPlayerId ?? 0,
+                ["localFactionSlot"] = Patches.CommandInterceptor.LocalPlayerId,
+                ["hasDisconnectAlert"] = Sync.CoopSessionManager.HasDisconnectAlert,
+                ["disconnectAlertSlot"] = Sync.CoopSessionManager.DisconnectAlertSlot,
+                ["disconnectAlertName"] = Sync.CoopSessionManager.DisconnectAlertPlayerName,
+                ["disconnectAlertVisible"] = UI.DisconnectNoticeOverlay.IsVisible,
                 ["roomPhase"] = Sync.CoopSessionManager.RoomPhase.ToString(),
                 ["canStart"] = Sync.CoopSessionManager.CanHostStartGame,
                 ["balancePreset"] = Sync.CoopSessionManager.BalancePreset.ToString(),
@@ -790,6 +804,21 @@ namespace TABCoopMod.Testing
                     var modal = DXVision.GUI.DXModalScreen.CurrentModalObject;
                     if (modal != null) GameBridge.CloseZXWindow(modal);
                     return new Dictionary<string, object> { ["ok"] = modal != null };
+                case "disconnect_pause":
+                    Sync.CoopSessionManager.TogglePauseForDisconnectWait();
+                    return new Dictionary<string, object>
+                    {
+                        ["ok"] = true,
+                        ["paused"] = Determinism.LockstepClock.PausedBySession || (DXGame.Current?.Paused ?? false)
+                    };
+                case "disconnect_save_exit":
+                    return new Dictionary<string, object>
+                    {
+                        ["ok"] = Sync.CoopSessionManager.HostSaveAndExitFromAlert(GetStr(args, "saveName"))
+                    };
+                case "disconnect_dismiss":
+                    Sync.CoopSessionManager.DismissDisconnectAlert();
+                    return new Dictionary<string, object> { ["ok"] = true };
                 case "test_select":
                 {
                     ulong eid = GetULong(args, "entityId", 0);
@@ -1042,6 +1071,96 @@ namespace TABCoopMod.Testing
             };
         }
 
+        private static DXEntity ResolveTargetInn(Dictionary<string, object> args)
+        {
+            ulong innId = GetULong(args, "innId", 0UL);
+            if (innId != 0UL)
+            {
+                var ent = DXGame.Current?.GetEntityByID(innId);
+                return GameBridge.IsTheInnEntity(ent) ? ent : null;
+            }
+            foreach (var ent in GameBridge.GetPlayerEntities())
+            {
+                if (!GameBridge.IsTheInnEntity(ent)) continue;
+                if (Sync.CoopSessionManager.IsMultiFactionActive
+                    && !Sync.FactionOwnershipTracker.CanPlayerControl(CommandInterceptor.LocalPlayerId, ent))
+                    continue;
+                return ent;
+            }
+            return null;
+        }
+
+        private static object GetInnSlotsInfo(Dictionary<string, object> args)
+        {
+            DXEntity inn = ResolveTargetInn(args);
+            var slots = new List<Dictionary<string, object>>();
+            int mercCount = inn != null ? GameBridge.GetTheInnMercenaryCount(inn) : -1;
+            if (inn != null)
+            {
+                var cmds = GameBridge.GetAvailableCommandsForEntity(inn);
+                if (cmds != null)
+                {
+                    foreach (object cmd in cmds)
+                    {
+                        if (!GameBridge.TryGetContractMercenaryInfo(cmd, inn, out int slot, out Type entType, out _, out _))
+                            continue;
+                        if (slot <= 0 || entType == null) continue;
+                        bool canExec = GameBridge.CanExecuteCommandOnEntity(cmd, inn);
+                        slots.Add(new Dictionary<string, object>
+                        {
+                            ["slot"] = slot,
+                            ["entityType"] = entType.FullName,
+                            ["canExecute"] = canExec
+                        });
+                    }
+                }
+            }
+            return new Dictionary<string, object>
+            {
+                ["ok"] = inn != null,
+                ["innId"] = inn?.ID ?? 0UL,
+                ["mercCount"] = mercCount,
+                ["slots"] = slots
+            };
+        }
+
+        private static object InvokeInnSlot(Dictionary<string, object> args)
+        {
+            int targetSlot = GetInt(args, "slot", 1);
+            DXEntity inn = ResolveTargetInn(args);
+            if (inn == null)
+                return new Dictionary<string, object> { ["ok"] = false, ["error"] = "TheInn not found" };
+
+            var cmds = GameBridge.GetAvailableCommandsForEntity(inn);
+            object matched = null;
+            if (cmds != null)
+            {
+                foreach (object cmd in cmds)
+                {
+                    if (GameBridge.TryGetContractMercenaryInfo(cmd, inn, out int slot, out _, out _, out _) && slot == targetSlot)
+                    {
+                        matched = cmd;
+                        break;
+                    }
+                }
+            }
+            if (matched == null)
+                return new Dictionary<string, object> { ["ok"] = false, ["error"] = $"Mercenary slot {targetSlot} not found" };
+
+            GameBridge.TryGetContractMercenaryInfo(matched, inn, out _, out Type entType, out _, out int mercCount);
+            object cmdTarget = GameBridge.CreateCommandTarget(PointF.Empty, SizeF.Empty, PointF.Empty, 0UL);
+            // Invokes ZXCommand.Execute cleanly through Harmony Patch_ZXCommand_Execute just like a real UI click.
+            GameBridge.ExecuteCommandOnEntity(matched, inn, cmdTarget);
+            return new Dictionary<string, object>
+            {
+                ["ok"] = entType != null,
+                ["innId"] = inn.ID,
+                ["slot"] = targetSlot,
+                ["mercCountBefore"] = mercCount,
+                ["entityType"] = entType?.FullName ?? string.Empty
+            };
+        }
+
         private static bool HasModalEditBox(DXVision.DXObject root)
         {
             if (root == null) return false;
@@ -1113,10 +1232,10 @@ namespace TABCoopMod.Testing
         private static object GetFactionState()
         {
             FactionContextManager.FlushActiveOwnerFromLevelState();
-            int maxP = Math.Max(1, Math.Min(3, (int)FactionOwnershipTracker.ActivePlayerCount));
             var players = new List<Dictionary<string, object>>();
-            for (byte pid = 1; pid <= maxP; pid++)
+            for (byte pid = 1; pid <= 3; pid++)
             {
+                if (!Sync.FactionOwnershipTracker.IsSlotParticipating(pid)) continue;
                 var l = FactionContextManager.GetLedger(pid);
                 if (l == null) continue;
                 var e = l.Economy;
@@ -1271,9 +1390,119 @@ namespace TABCoopMod.Testing
             int o = GetInt(args, "oil", 0);
             int extraStorage = GetInt(args, "extraStorage", 0);
             int extraWorkers = GetInt(args, "extraWorkers", 0);
+            int extraFood = GetInt(args, "extraFood", 0);
+            int extraEnergy = GetInt(args, "extraEnergy", 0);
             int extraColonists = GetInt(args, "extraColonists", 0);
-            FactionContextManager.AdjustResourcesForTesting(pid, g, w, s, i, o, extraStorage, extraWorkers, extraColonists);
+            if (FactionContextManager.IsInitialized)
+            {
+                FactionContextManager.AdjustResourcesForTesting(pid, g, w, s, i, o, extraStorage, extraWorkers, extraColonists, extraFood, extraEnergy);
+            }
+            else if (GameBridge.ReadRawLevelEconomyState(out _))
+            {
+                if (extraWorkers != 0 || extraFood != 0 || extraEnergy != 0)
+                {
+                    GameBridge.AddLevelStateCommandCenterExtras(extraWorkers, extraFood, extraEnergy);
+                    if (GameBridge.TypeCommandCenter != null && DXGame.Current != null)
+                    {
+                        foreach (var cc in DXGame.Current.EntitiesOfType(GameBridge.TypeCommandCenter))
+                            GameBridge.CallBuildingRecalculateNear(cc);
+                    }
+                    GameBridge.RecalcLevelStateResources();
+                }
+                if (GameBridge.ReadRawLevelEconomyState(out var raw))
+                {
+                    if (extraStorage != 0) raw.ResourceStorage = Math.Max(50, raw.ResourceStorage + extraStorage);
+                    if (extraColonists != 0) raw.Colonists += extraColonists;
+                    raw.Gold = Math.Max(0, Math.Min(Math.Max(50, raw.ResourceStorage) * 40, raw.Gold + g));
+                    raw.Wood = Math.Max(0, Math.Min(Math.Max(50, raw.ResourceStorage), raw.Wood + w));
+                    raw.Stone = Math.Max(0, Math.Min(Math.Max(50, raw.ResourceStorage), raw.Stone + s));
+                    raw.Iron = Math.Max(0, Math.Min(Math.Max(50, raw.ResourceStorage), raw.Iron + i));
+                    raw.Oil = Math.Max(0, Math.Min(Math.Max(50, raw.ResourceStorage), raw.Oil + o));
+                    GameBridge.WriteRawLevelEconomyState(in raw);
+                }
+            }
             return GetFactionState();
+        }
+
+        private static DXGame _cachedResCalcGame;
+        private static object _cachedResCalcSystem;
+        private static MethodInfo _cachedCalcYieldMethod;
+        private static PropertyInfo _cachedCostWoodProp;
+
+        private static bool TryComputeWoodYield(Rectangle rect, DXEntity templateEntity, out int woodYield)
+        {
+            woodYield = 0;
+            DXGame game = DXGame.Current;
+            if (game == null || templateEntity == null) return false;
+            try
+            {
+                if (!object.ReferenceEquals(_cachedResCalcGame, game) || _cachedResCalcSystem == null || _cachedCalcYieldMethod == null)
+                {
+                    _cachedResCalcGame = game;
+                    _cachedResCalcSystem = null;
+                    _cachedCalcYieldMethod = null;
+                    _cachedCostWoodProp = null;
+                    foreach (DXSystem sys in game.Systems)
+                    {
+                        if (sys == null) continue;
+                        foreach (MethodInfo m in sys.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance))
+                        {
+                            if (m.ReturnType == null || m.ReturnType.Name != "ZXResourcesCost") continue;
+                            ParameterInfo[] ps = m.GetParameters();
+                            if (ps.Length == 2 && ps[0].ParameterType == typeof(Rectangle) && typeof(DXEntity).IsAssignableFrom(ps[1].ParameterType))
+                            {
+                                _cachedResCalcSystem = sys;
+                                _cachedCalcYieldMethod = m;
+                                _cachedCostWoodProp = m.ReturnType.GetProperty("Wood", BindingFlags.Public | BindingFlags.Instance);
+                                break;
+                            }
+                        }
+                        if (_cachedCalcYieldMethod != null) break;
+                    }
+                }
+                if (_cachedResCalcSystem == null || _cachedCalcYieldMethod == null || _cachedCostWoodProp == null)
+                    return false;
+                object costObj = _cachedCalcYieldMethod.Invoke(_cachedResCalcSystem, new object[] { rect, templateEntity });
+                if (costObj == null) return false;
+                woodYield = (int)_cachedCostWoodProp.GetValue(costObj, null);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool TryFindNearestWoodTarget(float cx, float cy, int maxR, out int treeX, out int treeY)
+        {
+            treeX = 0;
+            treeY = 0;
+            Type sawmillType = GameBridge.GameAssembly?.GetType("ZX.Entities.Sawmill");
+            DXEntity sawmillTmpl = sawmillType != null ? (DXGame.Current?.GetEntityFromType(sawmillType) as DXEntity) : null;
+            if (sawmillTmpl == null) return false;
+            var size = new SizeF(Math.Max(1, sawmillTmpl.CellSize.Width), Math.Max(1, sawmillTmpl.CellSize.Height));
+            for (int r = 4; r <= maxR; r += 2)
+            {
+                for (int dx = -r; dx <= r; dx += 2)
+                {
+                    for (int dy = -r; dy <= r; dy += 2)
+                    {
+                        if (Math.Max(Math.Abs(dx), Math.Abs(dy)) < r - 1) continue;
+                        int ix = (int)cx + dx;
+                        int iy = (int)cy + dy;
+                        if (!DXWorldGrid.ExistCell(ix, iy)) continue;
+                        var pt = new PointF(ix, iy);
+                        Rectangle rect = GameBridge.ResolveBuildCellArea(sawmillTmpl, pt, size, pt);
+                        if (rect.Width > 0 && rect.Height > 0 && TryComputeWoodYield(rect, sawmillTmpl, out int wy) && wy >= 4)
+                        {
+                            treeX = ix;
+                            treeY = iy;
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
         }
 
         private static object FindBuildSpot(Dictionary<string, object> args)
@@ -1283,17 +1512,29 @@ namespace TABCoopMod.Testing
             float cy = GetFloat(args, "cy");
             int w = GetInt(args, "sizeW", 3);
             int h = GetInt(args, "sizeH", 3);
-            int maxR = Math.Max(4, Math.Min(48, GetInt(args, "maxRadius", 28)));
+            int maxR = Math.Max(4, Math.Min(64, GetInt(args, "maxRadius", 28)));
+            bool isSawmill = string.Equals(typeName, "ZX.Entities.Sawmill", StringComparison.Ordinal);
+            int minWood = GetInt(args, "minWood", isSawmill ? 4 : 0);
+            bool towardWood = GetBool(args, "towardWood", false);
 
             Type bt = GameBridge.GameAssembly?.GetType(typeName);
             if (bt == null) throw new ArgumentException($"unknown building type '{typeName}'");
 
-            if (DXGame.Current?.GetEntityFromType(bt) is DXEntity tmpl && tmpl.CellSize.Width > 0 && tmpl.CellSize.Height > 0)
+            DXEntity tmpl = DXGame.Current?.GetEntityFromType(bt) as DXEntity;
+            if (tmpl != null && tmpl.CellSize.Width > 0 && tmpl.CellSize.Height > 0)
             {
                 w = tmpl.CellSize.Width;
                 h = tmpl.CellSize.Height;
             }
             var size = new SizeF(w, h);
+
+            int targetTreeX = 0, targetTreeY = 0;
+            bool hasWoodGoal = towardWood && TryFindNearestWoodTarget(cx, cy, Math.Max(maxR, 56), out targetTreeX, out targetTreeY);
+            bool foundAny = false;
+            PointF bestPt = PointF.Empty;
+            int bestWood = int.MinValue;
+            double bestDistSq = double.MaxValue;
+
             for (int r = 4; r <= maxR; r++)
             {
                 int step = r <= 32 ? 1 : 2;
@@ -1308,19 +1549,72 @@ namespace TABCoopMod.Testing
                             continue;
 
                         var pt = new PointF(ix, iy);
-                        if (GameBridge.CanPlaceBuildingAtTarget(bt, pt, size, pt))
+                        if (!GameBridge.CanPlaceBuildingAtTarget(bt, pt, size, pt))
+                            continue;
+
+                        if (minWood > 0 && tmpl != null)
                         {
-                            return new Dictionary<string, object>
+                            Rectangle rect = GameBridge.ResolveBuildCellArea(tmpl, pt, size, pt);
+                            if (rect.Width > 0 && rect.Height > 0 && TryComputeWoodYield(rect, tmpl, out int wy))
                             {
-                                ["found"] = true,
-                                ["x"] = pt.X,
-                                ["y"] = pt.Y,
-                                ["sizeW"] = w,
-                                ["sizeH"] = h
-                            };
+                                if (wy > bestWood)
+                                {
+                                    bestWood = wy;
+                                    bestPt = pt;
+                                    foundAny = wy >= minWood;
+                                }
+                                if (wy >= Math.Max(minWood, 8))
+                                {
+                                    return new Dictionary<string, object>
+                                    {
+                                        ["found"] = true,
+                                        ["x"] = pt.X,
+                                        ["y"] = pt.Y,
+                                        ["sizeW"] = w,
+                                        ["sizeH"] = h,
+                                        ["woodYield"] = wy
+                                    };
+                                }
+                            }
+                            continue;
                         }
+
+                        if (hasWoodGoal)
+                        {
+                            double d2 = (double)(ix - targetTreeX) * (ix - targetTreeX) + (double)(iy - targetTreeY) * (iy - targetTreeY);
+                            if (d2 < bestDistSq)
+                            {
+                                bestDistSq = d2;
+                                bestPt = pt;
+                                foundAny = true;
+                            }
+                            continue;
+                        }
+
+                        return new Dictionary<string, object>
+                        {
+                            ["found"] = true,
+                            ["x"] = pt.X,
+                            ["y"] = pt.Y,
+                            ["sizeW"] = w,
+                            ["sizeH"] = h
+                        };
                     }
                 }
+            }
+
+            if (foundAny)
+            {
+                var res = new Dictionary<string, object>
+                {
+                    ["found"] = true,
+                    ["x"] = bestPt.X,
+                    ["y"] = bestPt.Y,
+                    ["sizeW"] = w,
+                    ["sizeH"] = h
+                };
+                if (bestWood > int.MinValue) res["woodYield"] = bestWood;
+                return res;
             }
 
             return new Dictionary<string, object> { ["found"] = false };
@@ -1384,6 +1678,36 @@ namespace TABCoopMod.Testing
                 ["queuedRequests"] = reqs,
                 ["queuedUnits"] = units
             };
+        }
+
+        private static object ForcePlaceBuilding(Dictionary<string, object> args)
+        {
+            string typeName = GetStr(args, "buildingType") ?? "ZX.Entities.TheInn";
+            if (GameBridge.GameAssembly?.GetType(typeName) == null)
+                throw new ArgumentException($"unknown building type '{typeName}'");
+
+            float x = GetFloat(args, "x");
+            float y = GetFloat(args, "y");
+            float w = GetFloat(args, "sizeW", 3f);
+            float h = GetFloat(args, "sizeH", 3f);
+            ulong builderId = GetULong(args, "builderId", 0);
+            var ids = builderId != 0UL ? new[] { builderId } : Array.Empty<ulong>();
+            byte pid = (byte)GetInt(args, "playerId", CommandInterceptor.LocalPlayerId);
+            bool fastInn = GetBool(args, "fastInn", true);
+
+            var cmd = new NetCommand
+            {
+                Type = NetCommandType.TestForcePlaceBuilding,
+                PlayerId = pid,
+                BuildingTypeName = typeName,
+                ExecutorEntityIds = ids,
+                TargetPosition = new PointF(x, y),
+                TargetSize = new SizeF(w, h),
+                TargetOrigin = new PointF(x, y),
+                InstantBuild = fastInn
+            };
+            CommandInterceptor.Dispatch(cmd);
+            return new Dictionary<string, object> { ["dispatched"] = true, ["command"] = cmd.ToString() };
         }
 
         private static object SaveGameTool(Dictionary<string, object> args)

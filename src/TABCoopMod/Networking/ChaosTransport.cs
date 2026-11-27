@@ -218,6 +218,7 @@ namespace TABCoopMod.Networking
 
         public void StartHost(int maxPlayers = 3) => _inner.StartHost(maxPlayers);
         public void ConnectToHost(string targetAddressOrSteamId) => _inner.ConnectToHost(targetAddressOrSteamId);
+        public void DisconnectPeer(byte playerId) => _inner.DisconnectPeer(playerId);
 
         public void SendToPeer(byte targetPlayerId, SendChannel channel, PacketType type, Action<BinaryWriter> writePayload)
         {

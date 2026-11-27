@@ -25,6 +25,7 @@ namespace TABCoopMod.UI
             public DXTextObject Swatch;
             public DXTextObject NameLabel;
             public DXTextObject RoleBadge;
+            public CompactLobbyButton SwapButton;
         }
 
         private sealed class CompactLobbyButton : DXButton
@@ -193,6 +194,18 @@ namespace TABCoopMod.UI
                 case "open_custom_map":
                     OpenHostSingleplayerMenu("房主正在选择自定义地图...", GameBridge.OpenMainMenuCustomMap, rollSeed: true);
                     return true;
+                case "swap_seat_1":
+                    CoopSessionManager.RequestSeatSwap(1);
+                    RefreshUI();
+                    return true;
+                case "swap_seat_2":
+                    CoopSessionManager.RequestSeatSwap(2);
+                    RefreshUI();
+                    return true;
+                case "swap_seat_3":
+                    CoopSessionManager.RequestSeatSwap(3);
+                    RefreshUI();
+                    return true;
                 case "toggle_balance_preset":
                     CoopSessionManager.ToggleBalancePreset();
                     RefreshUI();
@@ -284,6 +297,23 @@ namespace TABCoopMod.UI
                     ShowLobbyWindow();
                 }
             }
+        }
+
+        /// <summary>Called when a join attempt is rejected after returning to entry view.</summary>
+        public static void NotifyEntryError(string message)
+        {
+            _entryStatusMessage = message ?? string.Empty;
+            if (_window != null && !_isClosing)
+                RefreshUI();
+        }
+
+        /// <summary>Clears stale lobby window reference when a level load resets the scene.</summary>
+        internal static void ClearStaleWindowOnLevelEnter()
+        {
+            _reopenAfterSingleplayerMenu = false;
+            _noModalSinceTicks = -1.0;
+            _window = null;
+            _isClosing = false;
         }
 
         /// <summary>Called from ReturnToMainMenuPrefix so no dangling modal reference remains.</summary>
@@ -622,20 +652,35 @@ namespace TABCoopMod.UI
                 var swatch = CreateSolidBox(2f * u, 2f * u, 8f * u, slotH - 4f * u, SlotColors[i], Color.Transparent, 0f);
                 bg.AddObject(swatch);
 
-                var nameLbl = CreateTextBox(18f * u, 0f, leftW - 145f * u, slotH, 11.5f * u, FontStyle.Bold, Color.WhiteSmoke,
+                var nameLbl = CreateTextBox(18f * u, 0f, leftW - 196f * u, slotH, 11.5f * u, FontStyle.Bold, Color.WhiteSmoke,
                     ContentAlignment.MiddleLeft, Color.Transparent, Color.Transparent, 0f);
                 bg.AddObject(nameLbl);
 
-                var badgeLbl = CreateTextBox(leftW - 125f * u, 0f, 115f * u, slotH, 10.5f * u, FontStyle.Bold, Color.Gray,
+                var badgeLbl = CreateTextBox(leftW - 174f * u, 0f, 92f * u, slotH, 10.5f * u, FontStyle.Bold, Color.Gray,
                     ContentAlignment.MiddleRight, Color.Transparent, Color.Transparent, 0f);
                 bg.AddObject(badgeLbl);
+
+                byte targetSlot = (byte)(i + 1);
+                var swapBtn = CreateCompactButton(
+                    "移至此",
+                    leftW - 76f * u,
+                    6f * u,
+                    68f * u,
+                    slotH - 12f * u,
+                    9.5f * u,
+                    Color.FromArgb(225, 28, 42, 58),
+                    BorderDimColor,
+                    Color.WhiteSmoke,
+                    () => CoopSessionManager.RequestSeatSwap(targetSlot));
+                bg.AddObject(swapBtn);
 
                 _slots[i] = new PlayerSlotRow
                 {
                     Background = bg,
                     Swatch = swatch,
                     NameLabel = nameLbl,
-                    RoleBadge = badgeLbl
+                    RoleBadge = badgeLbl,
+                    SwapButton = swapBtn
                 };
             }
 
@@ -956,13 +1001,19 @@ namespace TABCoopMod.UI
             string modeTitle = isMultiFaction ? "独立基地合作 (M4)" : "执政官共控模式";
             SetDynamicText(_rosterHeaderText, $"房间成员 ({peers.Count} / 3) — {modeTitle}");
 
+            byte localSlot = CoopSessionManager.GetFactionSlotForTransportId(localId);
+            bool canSwapSeat = CoopSessionManager.IsSessionActive
+                && !CoopSessionManager.IsInSyncedLevel
+                && CoopSessionManager.RoomPhase == LobbyRoomPhase.InLobby
+                && localId != 0;
+
             for (int i = 0; i < 3; i++)
             {
-                byte slotPlayerId = (byte)(i + 1);
+                byte slotFactionId = (byte)(i + 1);
                 PeerInfo match = null;
                 foreach (var p in peers)
                 {
-                    if (p.PlayerId == slotPlayerId) { match = p; break; }
+                    if (p != null && p.EffectiveFactionSlot == slotFactionId) { match = p; break; }
                 }
 
                 var row = _slots[i];
@@ -973,7 +1024,7 @@ namespace TABCoopMod.UI
                     SetSolidBoxColors(row.Background, SlotBgActiveColor, isMe ? SlotColors[i] : BorderGoldColor);
                     SetSolidBoxColors(row.Swatch, SlotColors[i], Color.Transparent);
 
-                    SetDynamicText(row.NameLabel, $"P{slotPlayerId} · {match.PlayerName}{(isMe ? " (我)" : "")}",
+                    SetDynamicText(row.NameLabel, $"P{slotFactionId} · {match.PlayerName}{(isMe ? " (我)" : "")}",
                         textColor: Color.WhiteSmoke);
 
                     if (isSlotHost)
@@ -988,15 +1039,47 @@ namespace TABCoopMod.UI
                     {
                         SetDynamicText(row.RoleBadge, "○ 未准备", textColor: Color.Orange);
                     }
+
+                    if (row.SwapButton != null)
+                    {
+                        row.SwapButton.Visible = canSwapSeat && !isMe;
+                        if (row.SwapButton.Visible)
+                        {
+                            SetCompactButtonStyle(
+                                row.SwapButton,
+                                "互换",
+                                Color.FromArgb(225, 28, 42, 58),
+                                Color.FromArgb(240, 46, 72, 100),
+                                BorderGoldColor,
+                                Color.Gold,
+                                Color.WhiteSmoke);
+                        }
+                    }
                 }
                 else
                 {
                     SetSolidBoxColors(row.Background, SlotBgEmptyColor, BorderDimColor);
                     SetSolidBoxColors(row.Swatch, Color.FromArgb(90, SlotColors[i]), Color.Transparent);
 
-                    SetDynamicText(row.NameLabel, $"P{slotPlayerId} · 空位（等待玩家加入）",
+                    SetDynamicText(row.NameLabel, $"P{slotFactionId} · 空位（等待玩家加入）",
                         textColor: Color.DimGray);
                     SetDynamicText(row.RoleBadge, "空位", textColor: Color.DimGray);
+
+                    if (row.SwapButton != null)
+                    {
+                        row.SwapButton.Visible = canSwapSeat && slotFactionId != localSlot;
+                        if (row.SwapButton.Visible)
+                        {
+                            SetCompactButtonStyle(
+                                row.SwapButton,
+                                "移至此",
+                                Color.FromArgb(225, 28, 42, 58),
+                                Color.FromArgb(240, 46, 72, 100),
+                                BorderDimColor,
+                                Color.Gold,
+                                Color.LightGray);
+                        }
+                    }
                 }
             }
 
@@ -1365,7 +1448,8 @@ namespace TABCoopMod.UI
                 return;
             }
 
-            string role = CoopSessionManager.Transport.IsHost ? "房主 P1" : $"客机 P{CoopSessionManager.Transport.LocalPlayerId}";
+            byte mySlot = CoopSessionManager.GetFactionSlotForTransportId(CoopSessionManager.Transport.LocalPlayerId);
+            string role = CoopSessionManager.Transport.IsHost ? $"房主 P{mySlot}" : $"客机 P{mySlot}";
             var snapshots = CoopSessionManager.GetRoomPeerConnectionSnapshots();
             int delayTicks = CoopSessionManager.InputDelayTicks;
             int delayMs = (int)Math.Round(delayTicks * Determinism.LockstepClock.MsPerLogicTick);

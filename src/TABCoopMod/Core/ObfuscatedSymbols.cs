@@ -131,6 +131,13 @@ namespace TABCoopMod.Core
         public const string Method_ZXCommand_IsVisible         = "#=zXAX1VeKTLe7O";
         public const string Method_ZXCommand_GetResourcesCost  = "#=zcPu1$70ruiRE";
         public const string Method_ZXCommand_CancelExecution   = "#=z9whD4sw=";
+        public const string Method_ZXCommand_GetTitle        = "#=zRIE20Dk=";
+        public const string Method_ZXCommand_GetDescription  = "#=zN6RTGJU=";
+        public const string Method_ZXCommand_GetIcon         = "#=z03r0ANZ63gzr";
+        public const string Method_ZXCommand_GetHelp         = "#=zBe_DERidxpqJ";
+        public const string Type_ContractMercenary             = "ZX.Commands.ContractMercenary";
+        public const string Type_TheInn                        = "ZX.Entities.TheInn";
+        public const string Method_TheInn_GetMercenaries       = "#=zsHCRSAjADbRATwM37ZifboM=";
         public const string Method_Build_PlaceBuilding         = "#=zBTwSMLo=";
         public const string Method_BuildOrTrain_GetForType     = "#=zQ4lx63I=";
 
@@ -180,6 +187,7 @@ namespace TABCoopMod.Core
         public const string Method_ZXLevelState_ConsumeBonus   = "#=z0b0u0bUCzEHXjLBj5A==";
         public const string Method_ZXLevelState_GetBonusCount  = "#=zBoOUVPKgrQd5bNC4RA==";
         public const string Method_ZXLevelState_GetSelectionGroups = "#=zjt55PivoReTlHchOXA==";
+        public const string Method_ZXLevelState_RecalcResources = "#=zgW9mPqUC4s5b";
 
         // ====================================================================
         // 9. GUI & MessageBox Helpers

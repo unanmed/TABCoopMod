@@ -162,7 +162,7 @@ namespace TABCoopMod.Sync
                 tendency,
                 ref rngState);
 
-            FactionOwnershipTracker.RegisterPendingCcOwners(placedCcs);
+            FactionOwnershipTracker.RegisterPendingCcOwners(placedCcs, CoopSessionManager.GetOccupiedFactionSlotsSorted());
 
             string ccSummary = string.Join(" ", chosenSpots.ConvertAll(p => $"({p.X},{p.Y})"));
             ModLogger.Info(

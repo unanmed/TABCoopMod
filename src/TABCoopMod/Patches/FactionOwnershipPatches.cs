@@ -193,6 +193,153 @@ namespace TABCoopMod.Patches
         }
     }
 
+    /// <summary>
+    /// Scopes ContractMercenary.Inn to the target executor TheInn (fixing Multi-Faction mode where
+    /// vanilla FirstOrDefault() always resolved P1's Inn), prevents List[-1] / out-of-range
+    /// ArgumentOutOfRangeException on ContractMercenary.EntityTemplate, and propagates faction
+    /// ownership to hired mercenary units.
+    /// </summary>
+    [HarmonyPatch]
+    public static class Patch_ContractMercenary_InnScope
+    {
+        public static IEnumerable<MethodBase> TargetMethods()
+        {
+            Type tMerc = GameBridge.GameAssembly?.GetType(ObfuscatedSymbols.Type_ContractMercenary);
+            Type tEnt = GameBridge.TypeZXEntity;
+            Type tTarget = GameBridge.TypeZXCommandTarget;
+            if (tMerc != null && tEnt != null)
+            {
+                string[] oneArgMethods =
+                {
+                    ObfuscatedSymbols.Method_ZXCommand_IsVisible,
+                    ObfuscatedSymbols.Method_ZXCommand_CanExecute,
+                    ObfuscatedSymbols.Method_ZXCommand_GetTitle,
+                    ObfuscatedSymbols.Method_ZXCommand_GetDescription,
+                    ObfuscatedSymbols.Method_ZXCommand_GetIcon,
+                    ObfuscatedSymbols.Method_ZXCommand_GetCost
+                };
+                foreach (string name in oneArgMethods)
+                {
+                    var m = AccessTools.Method(tMerc, name, new[] { tEnt });
+                    if (m != null) yield return m;
+                }
+                if (tTarget != null)
+                {
+                    var mExec = AccessTools.Method(tMerc, ObfuscatedSymbols.Method_Command_ExecuteImpl, new[] { tEnt, tTarget });
+                    if (mExec != null) yield return mExec;
+                }
+            }
+
+            if (GameBridge.TypeZXCommand != null && tEnt != null)
+            {
+                var mHelp = AccessTools.Method(GameBridge.TypeZXCommand, ObfuscatedSymbols.Method_ZXCommand_GetHelp, new[] { tEnt });
+                if (mHelp != null) yield return mHelp;
+            }
+        }
+
+        [HarmonyPrefix]
+        public static void Prefix(object __0, out DXEntity __state)
+        {
+            __state = GameBridge.ActiveContractMercenaryInn;
+            if (__0 is DXEntity ent && GameBridge.IsTheInnEntity(ent))
+                GameBridge.ActiveContractMercenaryInn = ent;
+        }
+
+        [HarmonyFinalizer]
+        public static void Finalizer(DXEntity __state)
+        {
+            GameBridge.ActiveContractMercenaryInn = __state;
+        }
+    }
+
+    [HarmonyPatch]
+    public static class Patch_ContractMercenary_GetInn
+    {
+        public static MethodBase TargetMethod()
+        {
+            Type tMerc = GameBridge.GameAssembly?.GetType(ObfuscatedSymbols.Type_ContractMercenary);
+            return tMerc != null ? AccessTools.PropertyGetter(tMerc, "Inn") : null;
+        }
+
+        [HarmonyPrefix]
+        public static bool Prefix(ref DXEntity __result)
+        {
+            DXEntity scoped = GameBridge.ActiveContractMercenaryInn;
+            if (scoped != null && !scoped.Disposed)
+            {
+                __result = scoped;
+                return false;
+            }
+
+            if (CoopSessionManager.IsMultiFactionActive
+                && !LockstepClock.IsSimulationThreadActive
+                && !CommandExecutor.IsReplayingCommand)
+            {
+                DXEntity selectedInn = GameBridge.GetLocalSelectedTheInn();
+                if (selectedInn != null)
+                {
+                    __result = selectedInn;
+                    return false;
+                }
+            }
+            return true;
+        }
+    }
+
+    [HarmonyPatch]
+    public static class Patch_ContractMercenary_SafeEntityTemplate
+    {
+        public static MethodBase TargetMethod()
+        {
+            Type tMerc = GameBridge.GameAssembly?.GetType(ObfuscatedSymbols.Type_ContractMercenary);
+            return tMerc != null ? AccessTools.PropertyGetter(tMerc, "EntityTemplate") : null;
+        }
+
+        [HarmonyPrefix]
+        public static bool Prefix(object __instance, ref DXEntityTemplate __result)
+        {
+            if (GameBridge.TryResolveSafeContractMercenaryTemplate(__instance, out DXEntityTemplate safeTemplate))
+            {
+                __result = safeTemplate;
+                return false;
+            }
+            return true;
+        }
+    }
+
+    [HarmonyPatch]
+    public static class Patch_ContractMercenary_PropagateOwner
+    {
+        public static MethodBase TargetMethod()
+        {
+            Type tMerc = GameBridge.GameAssembly?.GetType(ObfuscatedSymbols.Type_ContractMercenary);
+            if (tMerc == null || GameBridge.TypeZXEntity == null || GameBridge.TypeZXCommandTarget == null)
+                return null;
+            return AccessTools.Method(
+                tMerc,
+                ObfuscatedSymbols.Method_Command_ExecuteImpl,
+                new[] { GameBridge.TypeZXEntity, GameBridge.TypeZXCommandTarget });
+        }
+
+        [HarmonyPrefix]
+        public static void Prefix(object __0, out byte __state)
+        {
+            __state = FactionSpawnContext.ActiveSpawningOwner;
+            if (!CoopSessionManager.IsMultiFactionActive) return;
+
+            byte owner = FactionOwnershipTracker.GetOwner(__0 as DXEntity);
+            if (owner == 0) owner = CommandExecutor.ActiveCommandPlayerId;
+            if (owner != 0)
+                FactionSpawnContext.ActiveSpawningOwner = owner;
+        }
+
+        [HarmonyFinalizer]
+        public static void Finalizer(byte __state)
+        {
+            FactionSpawnContext.ActiveSpawningOwner = __state;
+        }
+    }
+
     [HarmonyPatch(typeof(DXEntity), "InvokeAddToScene", new[] { typeof(DXObject) })]
     public static class Patch_DXEntity_InvokeAddToScene_AssignOwner
     {

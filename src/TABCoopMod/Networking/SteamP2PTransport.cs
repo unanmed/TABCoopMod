@@ -21,6 +21,16 @@ namespace TABCoopMod.Networking
             public PacketType Type;
             public byte[] Payload;
         }
+        private struct PendingReliableFrame
+        {
+            public CSteamID TargetSteamId;
+            public SendChannel Channel;
+            public PacketType Type;
+            public byte[] Frame;
+        }
+        private const int SteamReliableBackpressureBytes = 256 * 1024;
+        private const int SteamReliablePumpBudgetBytes = 256 * 1024;
+        private const int SteamReliableQueueHardLimitBytes = 384 * 1024;
         private static Callback<GameLobbyJoinRequested_t> _globalCbLobbyJoinRequested;
         private static Action<string> _globalInviteHandler;
         private static bool _startupLobbyChecked;
@@ -108,6 +118,8 @@ namespace TABCoopMod.Networking
         private readonly ConcurrentQueue<Action> _mainThreadActions = new ConcurrentQueue<Action>();
         private readonly Dictionary<byte, long> _cutoverPendingTs = new Dictionary<byte, long>();
         private readonly Dictionary<byte, List<HeldCommand>> _cutoverHoldQueue = new Dictionary<byte, List<HeldCommand>>();
+        private readonly Dictionary<ulong, Queue<PendingReliableFrame>> _reliableSendQueues = new Dictionary<ulong, Queue<PendingReliableFrame>>();
+        private readonly Dictionary<ulong, long> _lastSendFailWarnTs = new Dictionary<ulong, long>();
 
         public bool IsActive { get; private set; }
         public bool IsHost { get; private set; }
@@ -264,6 +276,7 @@ namespace TABCoopMod.Networking
             _lobbyCreateTimedOut = false;
             _peers.Clear();
             _playerToSteamId.Clear();
+            ClearAllReliableQueues();
 
             var mySteamId = SteamUser.GetSteamID();
             string myName = SteamFriends.GetPersonaName() ?? "Host";
@@ -297,6 +310,7 @@ namespace TABCoopMod.Networking
             _lobbyCreateTimedOut = false;
             _peers.Clear();
             _playerToSteamId.Clear();
+            ClearAllReliableQueues();
             InitializeDirectFastPath(false);
             SteamNetworking.AllowP2PPacketRelay(true);
 
@@ -464,6 +478,7 @@ namespace TABCoopMod.Networking
                 _cutoverPendingTs.Remove(disconnectedPlayerId);
                 _cutoverHoldQueue.Remove(disconnectedPlayerId);
                 _direct?.RemovePeer(disconnectedPlayerId);
+                ClearReliableQueue(leftSteamId.m_SteamID);
                 ModLogger.Info($"[SteamP2PTransport] Steam lobby member left: SteamID={leftSteamId.m_SteamID} -> PlayerId={disconnectedPlayerId}");
                 OnPeerDisconnected?.Invoke(disconnectedPlayerId);
             }
@@ -500,6 +515,7 @@ namespace TABCoopMod.Networking
                     _cutoverPendingTs.Remove(deadId);
                     _cutoverHoldQueue.Remove(deadId);
                     _direct?.RemovePeer(deadId);
+                    ClearReliableQueue(param.m_steamIDRemote.m_SteamID);
                     OnPeerDisconnected?.Invoke(deadId);
                     break;
                 }
@@ -607,12 +623,154 @@ namespace TABCoopMod.Networking
                 ? EP2PSend.k_EP2PSendReliable
                 : EP2PSend.k_EP2PSendUnreliableNoDelay;
 
-            bool ok = SteamNetworking.SendP2PPacket(targetSteamId, frame, (uint)frame.Length, sendType, (int)channel);
+            if (channel == SendChannel.UnreliableSequenced)
+            {
+                return SteamNetworking.SendP2PPacket(targetSteamId, frame, (uint)frame.Length, sendType, (int)channel);
+            }
+
+            if (HasQueuedReliableFrames(targetSteamId.m_SteamID) || ShouldBackpressureSteamSend(targetSteamId, frame.Length))
+            {
+                EnqueueReliableFrame(targetSteamId, channel, type, frame);
+                TryWarmSteamP2PSession(targetSteamId);
+                return false;
+            }
+
+            bool ok = TrySendSteamFrameRaw(targetSteamId, channel, type, frame, allowWarn: true);
             if (!ok)
             {
-                ModLogger.Warn($"[SteamP2PTransport] SendP2PPacket failed: target={targetSteamId}, type={type}, ch={channel}, sendType={sendType}, bytes={frame.Length}");
+                EnqueueReliableFrame(targetSteamId, channel, type, frame);
+                TryWarmSteamP2PSession(targetSteamId);
             }
             return ok;
+        }
+
+        private bool TrySendSteamFrameRaw(CSteamID targetSteamId, SendChannel channel, PacketType type, byte[] frame, bool allowWarn)
+        {
+            var sendType = channel != SendChannel.UnreliableSequenced
+                ? EP2PSend.k_EP2PSendReliable
+                : EP2PSend.k_EP2PSendUnreliableNoDelay;
+            bool ok = SteamNetworking.SendP2PPacket(targetSteamId, frame, (uint)frame.Length, sendType, (int)channel);
+            if (!ok && allowWarn)
+            {
+                long nowTs = Stopwatch.GetTimestamp();
+                ulong key = targetSteamId.m_SteamID;
+                bool shouldWarn = !_lastSendFailWarnTs.TryGetValue(key, out long prevTs)
+                    || (nowTs - prevTs) * 1000.0 / Stopwatch.Frequency >= 2000.0;
+                if (shouldWarn)
+                {
+                    _lastSendFailWarnTs[key] = nowTs;
+                    int queuedCount = _reliableSendQueues.TryGetValue(key, out var q) ? q.Count : 0;
+                    ModLogger.Warn($"[SteamP2PTransport] SendP2PPacket deferred to retry queue: target={targetSteamId}, type={type}, ch={channel}, bytes={frame.Length}, q={queuedCount}");
+                }
+            }
+            return ok;
+        }
+
+        private static bool ShouldBackpressureSteamSend(CSteamID targetSteamId, int nextFrameBytes)
+        {
+            try
+            {
+                if (SteamNetworking.GetP2PSessionState(targetSteamId, out P2PSessionState_t st))
+                {
+                    if (st.m_nBytesQueuedForSend >= SteamReliableQueueHardLimitBytes)
+                        return true;
+                    if (nextFrameBytes > 4096 && st.m_nBytesQueuedForSend >= SteamReliableBackpressureBytes)
+                        return true;
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        private static void TryWarmSteamP2PSession(CSteamID targetSteamId)
+        {
+            try
+            {
+                if (!targetSteamId.IsValid()) return;
+                if (!SteamNetworking.GetP2PSessionState(targetSteamId, out P2PSessionState_t st)
+                    || (st.m_bConnectionActive == 0 && st.m_bConnecting == 0))
+                {
+                    SteamNetworking.AcceptP2PSessionWithUser(targetSteamId);
+                }
+            }
+            catch { }
+        }
+
+        private bool HasQueuedReliableFrames(ulong steamId64)
+        {
+            return _reliableSendQueues.TryGetValue(steamId64, out var q) && q.Count > 0;
+        }
+
+        private void EnqueueReliableFrame(CSteamID targetSteamId, SendChannel channel, PacketType type, byte[] frame)
+        {
+            if (!_reliableSendQueues.TryGetValue(targetSteamId.m_SteamID, out var q))
+            {
+                q = new Queue<PendingReliableFrame>(32);
+                _reliableSendQueues[targetSteamId.m_SteamID] = q;
+            }
+            q.Enqueue(new PendingReliableFrame
+            {
+                TargetSteamId = targetSteamId,
+                Channel = channel,
+                Type = type,
+                Frame = frame
+            });
+        }
+
+        private void ClearReliableQueue(ulong steamId64)
+        {
+            _reliableSendQueues.Remove(steamId64);
+            _lastSendFailWarnTs.Remove(steamId64);
+        }
+
+        private void ClearAllReliableQueues()
+        {
+            _reliableSendQueues.Clear();
+            _lastSendFailWarnTs.Clear();
+        }
+
+        private void PumpReliableSendQueues()
+        {
+            if (_disposed || !IsActive || _reliableSendQueues.Count == 0) return;
+
+            List<ulong> completedKeys = null;
+            foreach (var kv in _reliableSendQueues)
+            {
+                var q = kv.Value;
+                if (q == null || q.Count == 0)
+                {
+                    if (completedKeys == null) completedKeys = new List<ulong>(2);
+                    completedKeys.Add(kv.Key);
+                    continue;
+                }
+
+                CSteamID target = q.Peek().TargetSteamId;
+                TryWarmSteamP2PSession(target);
+
+                int budget = SteamReliablePumpBudgetBytes;
+                while (q.Count > 0 && budget > 0)
+                {
+                    var head = q.Peek();
+                    if (ShouldBackpressureSteamSend(head.TargetSteamId, head.Frame.Length))
+                        break;
+                    if (!TrySendSteamFrameRaw(head.TargetSteamId, head.Channel, head.Type, head.Frame, allowWarn: false))
+                        break;
+                    q.Dequeue();
+                    budget -= head.Frame.Length;
+                }
+
+                if (q.Count == 0)
+                {
+                    if (completedKeys == null) completedKeys = new List<ulong>(2);
+                    completedKeys.Add(kv.Key);
+                }
+            }
+
+            if (completedKeys != null)
+            {
+                for (int i = 0; i < completedKeys.Count; i++)
+                    _reliableSendQueues.Remove(completedKeys[i]);
+            }
         }
 
         public void PollEvents()
@@ -622,6 +780,7 @@ namespace TABCoopMod.Networking
             try
             {
                 SteamAPI.RunCallbacks();
+                PumpReliableSendQueues();
 
                 if (IsHost && !_currentLobbyId.IsValid() && !_lobbyCreateTimedOut
                     && string.IsNullOrEmpty(LobbyError) && _lobbyCreateStartTs > 0)
@@ -645,6 +804,7 @@ namespace TABCoopMod.Networking
                     catch (Exception ex) { ModLogger.Warn($"[SteamP2PTransport] Main-thread action failed: {ex.Message}"); }
                 }
 
+                PumpReliableSendQueues();
                 CheckExpiredCutoverBarriers();
                 PumpDirectFastPathRetry();
 
@@ -753,6 +913,9 @@ namespace TABCoopMod.Networking
                         w.Write(p.IsReady);
                     }
                     w.Write(ModInfo.Version);
+                    w.Write((byte)_peers.Count);
+                    foreach (var p in _peers)
+                        w.Write(p.EffectiveFactionSlot);
                 });
 
                 if (isDuplicate)
@@ -775,15 +938,19 @@ namespace TABCoopMod.Networking
                 byte count = reader.ReadByte();
                 _peers.Clear();
                 _playerToSteamId.Clear();
+                var acceptedPeers = new List<PeerInfo>(count);
                 for (int i = 0; i < count; i++)
                 {
+                    byte pid = reader.ReadByte();
                     var p = new PeerInfo
                     {
-                        PlayerId = reader.ReadByte(),
+                        PlayerId = pid,
+                        FactionSlot = pid,
                         PlayerName = reader.ReadString(),
                         SteamId64 = reader.ReadUInt64(),
                         IsReady = reader.ReadBoolean()
                     };
+                    acceptedPeers.Add(p);
                     _peers.RemoveAll(existing => existing.PlayerId == p.PlayerId || (p.SteamId64 != 0 && existing.SteamId64 == p.SteamId64 && existing.PlayerId != 1));
                     _peers.Add(p);
                     if (p.SteamId64 != 0)
@@ -794,6 +961,16 @@ namespace TABCoopMod.Networking
                     : (_currentLobbyId.IsValid() ? SteamMatchmaking.GetLobbyData(_currentLobbyId, "tab_coop_ver") : string.Empty);
                 if (string.IsNullOrEmpty(hostVer))
                     hostVer = "<=0.1.1 (未知旧版本)";
+                if (reader.BaseStream.Position < reader.BaseStream.Length)
+                {
+                    byte slotCount = reader.ReadByte();
+                    for (int i = 0; i < slotCount && reader.BaseStream.Position < reader.BaseStream.Length; i++)
+                    {
+                        byte slot = reader.ReadByte();
+                        if (i < acceptedPeers.Count && slot >= 1 && slot <= 3)
+                            acceptedPeers[i].FactionSlot = slot;
+                    }
+                }
 
                 _direct?.SetLocalPlayerId(LocalPlayerId);
                 _direct?.RefreshExternalCandidatesAsync();
@@ -839,6 +1016,7 @@ namespace TABCoopMod.Networking
                 _peers.Add(new PeerInfo
                 {
                     PlayerId = p.PlayerId,
+                    FactionSlot = p.EffectiveFactionSlot,
                     PlayerName = p.PlayerName ?? string.Empty,
                     SteamId64 = p.SteamId64,
                     IsReady = p.IsReady
@@ -846,6 +1024,31 @@ namespace TABCoopMod.Networking
                 if (p.SteamId64 != 0)
                     _playerToSteamId[p.PlayerId] = new CSteamID(p.SteamId64);
             }
+        }
+
+        public void SetLobbyJoinable(bool joinable)
+        {
+            if (_disposed || !IsActive || !IsHost || !_currentLobbyId.IsValid()) return;
+            try
+            {
+                SteamMatchmaking.SetLobbyJoinable(_currentLobbyId, joinable);
+            }
+            catch (Exception ex)
+            {
+                ModLogger.Warn($"[SteamP2PTransport] SetLobbyJoinable({joinable}) failed: {ex.Message}");
+            }
+        }
+
+        public void DisconnectPeer(byte playerId)
+        {
+            if (playerId == 0 || playerId == LocalPlayerId) return;
+            if (_playerToSteamId.TryGetValue(playerId, out var sid))
+                ClearReliableQueue(sid.m_SteamID);
+            _playerToSteamId.Remove(playerId);
+            _peers.RemoveAll(p => p.PlayerId == playerId);
+            _cutoverPendingTs.Remove(playerId);
+            _cutoverHoldQueue.Remove(playerId);
+            _direct?.RemovePeer(playerId);
         }
 
         private void InitializeDirectFastPath(bool isHost)
@@ -928,6 +1131,8 @@ namespace TABCoopMod.Networking
                 for (int i = 0; i < staleIds.Count; i++)
                 {
                     byte pid = staleIds[i];
+                    if (_playerToSteamId.TryGetValue(pid, out var staleSid))
+                        ClearReliableQueue(staleSid.m_SteamID);
                     _playerToSteamId.Remove(pid);
                     _peers.RemoveAll(p => p.PlayerId == pid);
                     _cutoverPendingTs.Remove(pid);
@@ -1173,7 +1378,8 @@ namespace TABCoopMod.Networking
                 SendFallbackSlice(peerId, steamId, SendChannel.ReliableOrdered, bulkMsgs);
         }
 
-        private const int MaxSteamFallbackBatchPayloadBytes = 256 * 1024;
+        // Keep each Steam fallback frame <= 48 KB (~1 SnapshotChunk) so burst fallbacks do not overflow Steam's per-packet/queue limits.
+        private const int MaxSteamFallbackBatchPayloadBytes = 48 * 1024;
 
         private void SendFallbackSlice(byte peerId, CSteamID steamId, SendChannel steamChannel, List<DirectFastPathManager.FallbackMessage> msgs)
         {
@@ -1255,6 +1461,7 @@ namespace TABCoopMod.Networking
             _expectedLobbyId = CSteamID.Nil;
             _peers.Clear();
             _playerToSteamId.Clear();
+            ClearAllReliableQueues();
         }
     }
 }

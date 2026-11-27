@@ -18,6 +18,7 @@ namespace TABCoopMod.UI
         private const int Z = 2147483600;
         private static DXTextObject _button;
         private static DXObject _parent;
+        private static float _lastUnit = -1f;
         private static double _lastRefreshTicks = -1000.0;
 
         public static void Tick()
@@ -26,6 +27,8 @@ namespace TABCoopMod.UI
                 && CoopSessionManager.IsInSyncedLevel
                 && !LockstepClock.LoadingLevel
                 && !GameBridge.IsGameLoading()
+                && !GameBridge.IsLevelEnded()
+                && (DXGame.Current?.IAIterationInt ?? 0) > 0
                 && GameBridge.CurrentLevelState != null;
 
             if (!visible)
@@ -41,12 +44,16 @@ namespace TABCoopMod.UI
                 return;
             }
 
+            float u = DXScene.Unit > 0f ? DXScene.Unit : 1f;
+            bool unitChanged = Math.Abs(_lastUnit - u) > 0.02f;
+
             double now = DXHelper_Environment.Ticks;
-            if (now - _lastRefreshTicks < 200.0 && now >= _lastRefreshTicks)
+            if (!unitChanged && _button != null && ReferenceEquals(_parent, grid)
+                && now - _lastRefreshTicks < 200.0 && now >= _lastRefreshTicks)
                 return;
             _lastRefreshTicks = now;
 
-            if (_button == null || !ReferenceEquals(_parent, grid))
+            if (_button == null || !ReferenceEquals(_parent, grid) || unitChanged)
             {
                 Destroy();
                 Build(grid);
@@ -62,6 +69,7 @@ namespace TABCoopMod.UI
         public static void Reset()
         {
             Destroy();
+            _lastUnit = -1f;
             _lastRefreshTicks = -1000.0;
         }
 
@@ -79,6 +87,7 @@ namespace TABCoopMod.UI
                 };
                 _button.State.AreaStyle = DXObjectState.TAreaStyle.AreaInPixels;
                 float u = DXScene.Unit > 0f ? DXScene.Unit : 1f;
+                _lastUnit = u;
                 _button.TextRenderer.Font = new Font("Microsoft YaHei", Math.Max(8f, 9f * u), FontStyle.Bold);
                 _button.TextRenderer.TextAlign = ContentAlignment.MiddleCenter;
                 _button.TextRenderer.ColorText = Color.White;

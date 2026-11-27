@@ -92,7 +92,7 @@ namespace TABCoopMod.Sync
             }
         }
 
-        public static void RegisterPendingCcOwners(IReadOnlyList<DXEntity> orderedCcs)
+        public static void RegisterPendingCcOwners(IReadOnlyList<DXEntity> orderedCcs, byte[] preferredSlots = null)
         {
             if (orderedCcs == null) return;
             lock (_sync)
@@ -102,9 +102,108 @@ namespace TABCoopMod.Sync
                 {
                     var cc = orderedCcs[i];
                     if (cc != null && cc.ID != 0UL)
-                        _pendingCcOwners[cc.ID] = (byte)(i + 1);
+                    {
+                        byte slot = (preferredSlots != null && i < preferredSlots.Length && preferredSlots[i] >= 1 && preferredSlots[i] <= 3)
+                            ? preferredSlots[i]
+                            : (byte)(i + 1);
+                        _pendingCcOwners[cc.ID] = slot;
+                    }
                 }
             }
+        }
+
+        public static bool IsSlotParticipating(byte pid)
+        {
+            if (pid < 1 || pid > 3) return false;
+            lock (_sync)
+            {
+                foreach (var owner in _entityOwners.Values)
+                    if (owner == pid) return true;
+            }
+            return pid <= ActivePlayerCount;
+        }
+
+        public static byte[] GetParticipatingSlotsSorted()
+        {
+            var set = new SortedSet<byte>();
+            lock (_sync)
+            {
+                foreach (var owner in _entityOwners.Values)
+                    if (owner >= 1 && owner <= 3) set.Add(owner);
+            }
+            if (set.Count == 0)
+            {
+                int cnt = Math.Max(1, Math.Min(3, (int)ActivePlayerCount));
+                for (byte p = 1; p <= cnt; p++) set.Add(p);
+            }
+            var arr = new byte[set.Count];
+            set.CopyTo(arr);
+            return arr;
+        }
+
+        public static byte PickReconnectFactionSlot(ulong steamId64, ICollection<byte> occupiedSlots)
+        {
+            var ccs = GameBridge.GetAllCommandCenters(aliveOnly: true);
+            for (int i = 0; i < ccs.Count; i++)
+            {
+                byte owner = GetOwner(ccs[i].ID);
+                if (owner >= 1 && owner <= 3 && !IsExiled(owner) && (occupiedSlots == null || !occupiedSlots.Contains(owner)))
+                    return owner;
+            }
+            for (byte pid = 1; pid <= Math.Max((byte)1, ActivePlayerCount); pid++)
+            {
+                if (!IsExiled(pid) && (occupiedSlots == null || !occupiedSlots.Contains(pid)))
+                    return pid;
+            }
+            foreach (byte pid in GetParticipatingSlotsSorted())
+            {
+                if (!IsExiled(pid) && (occupiedSlots == null || !occupiedSlots.Contains(pid)))
+                    return pid;
+            }
+            return 0;
+        }
+
+        public static int EnsureUnownedPlayerEntitiesAssigned()
+        {
+            if (!IsInitialized) return 0;
+            var ccs = GameBridge.GetAllCommandCenters(aliveOnly: true);
+            if (ccs.Count == 0) return 0;
+
+            var ccOwners = new List<(DXEntity Cc, byte PlayerId)>(ccs.Count);
+            lock (_sync)
+            {
+                for (int i = 0; i < ccs.Count; i++)
+                {
+                    if (_entityOwners.TryGetValue(ccs[i].ID, out byte pid) && pid >= 1 && pid <= 3)
+                        ccOwners.Add((ccs[i], pid));
+                }
+            }
+            if (ccOwners.Count == 0) return 0;
+
+            var game = DXGame.Current;
+            var entities = GameBridge.GetEntitiesList(game);
+            int countBefore = _entityOwners.Count;
+            lock (_sync)
+            {
+                if (entities != null)
+                {
+                    for (int i = 0; i < entities.Count; i++)
+                    {
+                        var ent = entities[i];
+                        if (ent == null || ent.Disposed || ent.ID == 0UL || !GameBridge.IsPlayerEntity(ent)) continue;
+                        if (_entityOwners.ContainsKey(ent.ID)) continue;
+                        AssignEntityToNearestCcLocked(ent, ccOwners);
+                    }
+                }
+            }
+            int newlyAssigned = _entityOwners.Count - countBefore;
+            if (newlyAssigned > 0)
+            {
+                RefreshAllTrackedEntityColors();
+                ModLogger.Info($"[FactionOwnership] Assigned {newlyAssigned} unowned player entity/entities to nearest tracked CC without altering existing owners.");
+            }
+            InstallControlFilterIfNeeded();
+            return newlyAssigned;
         }
 
         public static void Reset()
@@ -345,24 +444,40 @@ namespace TABCoopMod.Sync
         /// Deterministically assigns initial ownership for all CommandCenters and nearby player
         /// units/structures on a fresh Multi-Faction match.
         /// </summary>
-        public static void AssignInitialOwnershipFromLevel(int playerCount)
+        public static void AssignInitialOwnershipFromLevel(int playerCount, byte[] targetSlots = null)
         {
-            int count = Math.Max(1, Math.Min(3, playerCount));
+            byte[] occupiedSlots = targetSlots ?? CoopSessionManager.GetOccupiedFactionSlotsSorted();
+            int count = Math.Max(1, Math.Min(3, Math.Max(playerCount, occupiedSlots?.Length ?? 0)));
             var ccs = GameBridge.GetAllCommandCenters(aliveOnly: true);
             var ccOwners = new List<(DXEntity Cc, byte PlayerId)>(ccs.Count);
+
+            var assignOrder = new List<byte>(3);
+            if (occupiedSlots != null)
+            {
+                for (int i = 0; i < occupiedSlots.Length; i++)
+                {
+                    byte s = occupiedSlots[i];
+                    if (s >= 1 && s <= 3 && !assignOrder.Contains(s))
+                        assignOrder.Add(s);
+                }
+            }
+            for (byte s = 1; s <= 3; s++)
+            {
+                if (!assignOrder.Contains(s))
+                    assignOrder.Add(s);
+            }
 
             lock (_sync)
             {
                 _entityOwners.Clear();
                 _exiledPlayers.Clear();
-                ActivePlayerCount = (byte)count;
 
                 var usedPids = new HashSet<byte>();
                 var assignedCcs = new byte[ccs.Count];
                 for (int i = 0; i < ccs.Count; i++)
                 {
                     if (_pendingCcOwners.TryGetValue(ccs[i].ID, out byte preferred)
-                        && preferred >= 1 && preferred <= count && !usedPids.Contains(preferred))
+                        && preferred >= 1 && preferred <= 3 && !usedPids.Contains(preferred))
                     {
                         assignedCcs[i] = preferred;
                         usedPids.Add(preferred);
@@ -370,20 +485,22 @@ namespace TABCoopMod.Sync
                 }
                 _pendingCcOwners.Clear();
 
-                byte nextSequential = 1;
+                int orderIdx = 0;
                 for (int i = 0; i < ccs.Count; i++)
                 {
                     byte pid = assignedCcs[i];
                     if (pid == 0)
                     {
-                        while (nextSequential <= count && usedPids.Contains(nextSequential))
-                            nextSequential++;
-                        pid = nextSequential <= count ? nextSequential++ : (byte)1;
+                        while (orderIdx < assignOrder.Count && usedPids.Contains(assignOrder[orderIdx]))
+                            orderIdx++;
+                        pid = orderIdx < assignOrder.Count ? assignOrder[orderIdx++] : (assignOrder.Count > 0 ? assignOrder[0] : (byte)1);
                         usedPids.Add(pid);
                     }
                     _entityOwners[ccs[i].ID] = pid;
                     ccOwners.Add((ccs[i], pid));
                 }
+
+                ActivePlayerCount = (byte)Math.Max(count, Math.Min(3, usedPids.Count));
 
                 var game = DXGame.Current;
                 var entities = GameBridge.GetEntitiesList(game);
@@ -417,8 +534,8 @@ namespace TABCoopMod.Sync
             }
 
             InstallControlFilterIfNeeded();
-            FactionContextManager.InitializeFromCurrentLevelState(count);
-            WonderCrowdfundManager.Initialize(count);
+            FactionContextManager.InitializeFromCurrentLevelState(ActivePlayerCount);
+            WonderCrowdfundManager.Initialize(ActivePlayerCount);
             GameBridge.SetZeroFeeMayorActive(CoopSessionManager.IsMultiFactionActive && !FactionContextManager.ZeroTransferFeeActive);
             RefreshAllTrackedEntityColors();
             ModLogger.Info($"[FactionOwnership] Initialized ownership for {count} players across {ccOwners.Count} CCs (tracked={TrackedEntityCount}).");
@@ -656,11 +773,19 @@ namespace TABCoopMod.Sync
         /// Live-level fallback for Host when loading a 1-CC save or 1-CC custom map in Multi-Faction mode:
         /// ensures at least <paramref name="playerCount"/> alive CommandCenters exist before snapshot export.
         /// </summary>
-        public static int EnsureExtraCommandCentersInLiveLevel(int playerCount)
+        public static int EnsureExtraCommandCentersInLiveLevel(int playerCount, byte[] targetSlots = null)
         {
-            if (playerCount < 2) return 0;
+            byte[] desiredSlots = targetSlots;
+            if (desiredSlots == null || desiredSlots.Length == 0)
+            {
+                int n = Math.Max(1, Math.Min(3, playerCount));
+                desiredSlots = new byte[n];
+                for (int i = 0; i < n; i++) desiredSlots[i] = (byte)(i + 1);
+            }
+            if (desiredSlots.Length < 2 && playerCount < 2) return 0;
+            int requiredCount = Math.Max(playerCount, desiredSlots.Length);
             var existingCcs = GameBridge.GetAllCommandCenters(aliveOnly: true);
-            if (existingCcs.Count >= playerCount) return 0;
+            if (existingCcs.Count >= requiredCount) return 0;
 
             var ccTemplate = GameBridge.GetEntityTemplateByType(GameBridge.TypeCommandCenter);
             var rangerTemplate = GameBridge.GetEntityTemplateByType(GameBridge.TypeRanger);
@@ -675,12 +800,13 @@ namespace TABCoopMod.Sync
             var placedCcs = new List<DXEntity>(existingCcs);
             int createdCcs = 0;
 
-            for (int p = existingCcs.Count + 1; p <= playerCount; p++)
+            for (int p = existingCcs.Count + 1; p <= requiredCount; p++)
             {
-                Point? spot = FindLiveFallbackBaseCell(placedCcs, terrain, nCells, playable, p);
+                byte slotForSpot = p - 1 < desiredSlots.Length ? desiredSlots[p - 1] : (byte)p;
+                Point? spot = FindLiveFallbackBaseCell(placedCcs, terrain, nCells, playable, slotForSpot);
                 if (!spot.HasValue)
                 {
-                    ModLogger.Warn($"[FactionOwnership] Could not find fallback spot for P{p} CommandCenter in live level.");
+                    ModLogger.Warn($"[FactionOwnership] Could not find fallback spot for P{slotForSpot} CommandCenter in live level.");
                     continue;
                 }
 
@@ -724,7 +850,7 @@ namespace TABCoopMod.Sync
 
             if (createdCcs > 0)
             {
-                RegisterPendingCcOwners(placedCcs);
+                RegisterPendingCcOwners(placedCcs, desiredSlots);
                 GameBridge.InvalidateCommandCenterCache();
                 GameBridge.RebuildEnergyGridNow();
             }

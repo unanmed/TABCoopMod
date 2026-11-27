@@ -10,9 +10,9 @@ namespace TABCoopMod.Core
     /// </summary>
     public static class ModInfo
     {
-        public const string Version = "0.2.12";
+        public const string Version = "0.2.14";
         public const string Tag = "v" + Version;
-        public const string AssemblyVersion = "0.2.12.0";
+        public const string AssemblyVersion = "0.2.14.0";
 
         public static string GetBuildTimestamp()
         {

@@ -22,9 +22,10 @@ namespace TABCoopMod.Commands
         SetGameSpeed = 7,        // GameSpeed multiplier change
         MayorVoteOrSelect = 8,   // Mayor selection (0 = left male, 1 = right female)
         TransferResource = 9,    // Market-unlocked ally resource transfer (20% fee, 0% with CoopMayor_ZeroTransferFee)
-        WonderContribute = 10,   // Functional Wonder 2-phase crowdfunding contribution
-        WonderWithdraw = 11,     // Functional Wonder 2-phase crowdfunding withdrawal (while funding phase open)
-        TestTriggerFinalSwarm = 12 // Test-harness synced FinalSwarm wave trigger for multiplayer benchmarks
+        WonderContribute = 10,     // Functional Wonder 2-phase crowdfunding contribution
+        WonderWithdraw = 11,       // Functional Wonder 2-phase crowdfunding withdrawal (while funding phase open)
+        TestTriggerFinalSwarm = 12,// Test-harness synced FinalSwarm wave trigger for multiplayer benchmarks
+        TestForcePlaceBuilding = 13// Test-harness synced instant building placement bypassing tech/upkeep gates
     }
 
     /// <summary>
@@ -367,6 +368,15 @@ namespace TABCoopMod.Commands
         [ThreadStatic]
         public static byte ActiveCommandPlayerId;
 
+        private static volatile bool _pendingCommandPanelRefresh;
+
+        internal static bool ConsumePendingCommandPanelRefresh()
+        {
+            if (!_pendingCommandPanelRefresh) return false;
+            _pendingCommandPanelRefresh = false;
+            return true;
+        }
+
         private const double RejectLogCooldownMs = 3000.0;
         private static string _lastRejectKey;
         private static double _lastRejectLogMs = -10000.0;
@@ -584,6 +594,11 @@ namespace TABCoopMod.Commands
                     case NetCommandType.TestTriggerFinalSwarm:
                         GameBridge.TriggerFinalSwarmEvents(out _, out _);
                         break;
+
+                    case NetCommandType.TestForcePlaceBuilding:
+                        ExecuteForcePlaceBuilding(netCmd);
+                        if (swappedContext) TABCoopMod.Sync.FactionContextManager.RecalculateAllFactions();
+                        break;
                 }
             }
             catch (Exception ex)
@@ -648,14 +663,22 @@ namespace TABCoopMod.Commands
                 if (GameBridge.IsResourceSpendingCommand(cmd, executor) && !GameBridge.CanExecuteCommandOnEntity(cmd, executor))
                 {
                     string cmdName = cmd.GetType().Name;
-                    LogRejected($"exec:{cmdName}", $"[CommandExecutor] Rejected {cmdName} on {entityId}: CanExecute=false.");
+                    string innDiag = GameBridge.IsTheInnEntity(executor)
+                        ? $" (slot={netCmd.QueueSlotIndex}, innMercCount={GameBridge.GetTheInnMercenaryCount(executor)})"
+                        : string.Empty;
+                    string rejDiag = GameBridge.DescribeCommandRejection(cmd, executor);
+                    LogRejected($"exec:{cmdName}", $"[CommandExecutor] Rejected {cmdName} on {entityId}{innDiag}{rejDiag}: CanExecute=false.");
                     continue;
                 }
 
                 GameBridge.ExecuteCommandOnEntity(cmd, executor, target);
                 GameBridge.NotifyUnitCommandExecuted(executor, cmd);
                 if (slotSensitive)
+                {
                     GameBridge.FlushStartFramePostMethods();
+                    if (GameBridge.IsTheInnEntity(executor))
+                        _pendingCommandPanelRefresh = true;
+                }
             }
         }
 
@@ -822,6 +845,53 @@ namespace TABCoopMod.Commands
             // Commit AddToScene() / replacement Destroy immediately so subsequent PlaceBuilding
             // commands in the same tick see occupied cells on DXWorldGrid.
             GameBridge.FlushStartFramePostMethods();
+        }
+
+        private static void ExecuteForcePlaceBuilding(NetCommand netCmd)
+        {
+            if (string.IsNullOrEmpty(netCmd.BuildingTypeName)) return;
+
+            Type buildingType = GameBridge.GameAssembly.GetType(netCmd.BuildingTypeName);
+            if (buildingType == null)
+            {
+                ModLogger.Warn($"[CommandExecutor] Unknown BuildingTypeName in force_place_building: {netCmd.BuildingTypeName}");
+                return;
+            }
+
+            ulong builderId = netCmd.ExecutorEntityIds.Length > 0 ? netCmd.ExecutorEntityIds[0] : 0UL;
+            object builder = builderId != 0UL ? DXGame.Current?.GetEntityByID(builderId) : null;
+            if (!IsLiveExecutableEntityForPlayer(builder, netCmd.PlayerId))
+            {
+                builder = TABCoopMod.Sync.CoopSessionManager.IsMultiFactionActive
+                    ? TABCoopMod.Sync.FactionOwnershipTracker.GetPrimaryCommandCenterForPlayer(netCmd.PlayerId)
+                    : GameBridge.GetCommandCenterEntity();
+            }
+            if (!IsLiveExecutableEntityForPlayer(builder, netCmd.PlayerId)) return;
+
+            if (!GameBridge.CanPlaceBuildingAtTarget(buildingType, netCmd.TargetPosition, netCmd.TargetSize, netCmd.TargetOrigin))
+            {
+                LogRejected($"forceBuildCell:{netCmd.BuildingTypeName}", $"[CommandExecutor] Rejected force_place_building {netCmd.BuildingTypeName} at ({netCmd.TargetPosition.X:F1},{netCmd.TargetPosition.Y:F1}): target cells occupied or invalid.");
+                return;
+            }
+
+            object target = BuildCommandTarget(netCmd);
+            byte prevSpawnOwner = FactionSpawnContext.ActiveSpawningOwner;
+            if (TABCoopMod.Sync.CoopSessionManager.IsMultiFactionActive && netCmd.PlayerId > 0)
+                FactionSpawnContext.ActiveSpawningOwner = netCmd.PlayerId;
+            try
+            {
+                object placed = GameBridge.PlaceBuilding(builder, target, buildingType, isBonus: false, instant: true, template: null);
+                GameBridge.FlushStartFramePostMethods();
+                if (placed is DXEntity placedEnt && TABCoopMod.Sync.CoopSessionManager.IsMultiFactionActive && netCmd.PlayerId > 0)
+                    TABCoopMod.Sync.FactionOwnershipTracker.SetOwner(placedEnt.ID, netCmd.PlayerId);
+                if (netCmd.InstantBuild && placed != null && GameBridge.IsTheInnEntity(placed))
+                    GameBridge.TriggerFastTheInnMercenaries(placed);
+                ModLogger.Info($"[CommandExecutor] ForcePlaceBuilding {netCmd.BuildingTypeName} (P{netCmd.PlayerId}) at ({netCmd.TargetPosition.X:F1},{netCmd.TargetPosition.Y:F1}) -> {(placed != null ? "OK" : "NULL")}");
+            }
+            finally
+            {
+                FactionSpawnContext.ActiveSpawningOwner = prevSpawnOwner;
+            }
         }
 
         private static void ExecuteCancelCurrentOrder(NetCommand netCmd)

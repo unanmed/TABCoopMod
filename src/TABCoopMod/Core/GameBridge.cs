@@ -47,6 +47,7 @@ namespace TABCoopMod.Core
         private static MethodInfo _mLocalize;
         private static MethodInfo _mGetSavesDir;
         private static MethodInfo _methodWriteSaveFile;
+        private static MethodInfo _methodSaveGameFlow;
         private static MethodInfo _methodLoadGameAndEnter;
         private static MethodInfo _methodShowTopBanner;
         private static MethodInfo _methodShowGroundIndicator;
@@ -66,10 +67,16 @@ namespace TABCoopMod.Core
         public static Type TypeBuilding { get; private set; }
         private static Type _typeEntityBonusCreation;
         private static Type _typeExtractFromSlot;
+        private static Type _typeContractMercenary;
+        public static Type TypeTheInn { get; private set; }
         private static PropertyInfo _propBonusCmdNSlot;
         private static PropertyInfo _propBonusCmdTemplate;
         private static PropertyInfo _propBonusCmdEntity;
         private static PropertyInfo _propExtractCmdNSlot;
+        private static PropertyInfo _propMercCmdNSlot;
+        private static PropertyInfo _propMercCmdTemplate;
+        private static PropertyInfo _propMercCmdEntity;
+        private static MethodInfo _mTheInnGetMercenaries;
         private static PropertyInfo _propCmdableAvailableCmds;
         private static FieldInfo _fieldZXGameAllCommands;
         private static MethodInfo _methodLevelStateConsumeBonus;
@@ -182,6 +189,8 @@ namespace TABCoopMod.Core
         private static PropertyInfo _propLevelEventAllInfectedToCC;
         private static PropertyInfo _propLevelStateExtraWorkers;
         private static PropertyInfo _propLevelStateExtraFood;
+        private static MethodInfo _methodLevelStateRecalcResources;
+        private static PropertyInfo _propGameStateRandom;
 
         private static MethodInfo _mCurCmd;
         private static MethodInfo _mCancelCur;
@@ -389,11 +398,13 @@ namespace TABCoopMod.Core
                 _mLocalize = AccessTools.Method(TypeZXGame, ObfuscatedSymbols.Method_ZXGame_Localize, new[] { typeof(string) });
                 _mGetSavesDir = AccessTools.Method(TypeZXGame, ObfuscatedSymbols.Method_ZXGame_GetSavesDirectory, Type.EmptyTypes);
                 _methodWriteSaveFile = AccessTools.Method(TypeZXGame, ObfuscatedSymbols.Method_ZXGame_WriteSaveFile, new[] { typeof(string) });
+                _methodSaveGameFlow = AccessTools.Method(TypeZXGame, ObfuscatedSymbols.Method_ZXGame_SaveGameFlow, new[] { typeof(string), typeof(Action), typeof(bool), typeof(bool) });
                 _methodLoadGameAndEnter = AccessTools.Method(TypeZXGame, ObfuscatedSymbols.Method_ZXGame_LoadGameAndEnter, new[] { typeof(string) });
 
                 Check(_mLocalize, "ZXGame.Localize");
                 Check(_mGetSavesDir, "ZXGame.GetSavesDirectory");
                 Check(_methodWriteSaveFile, "ZXGame.WriteSaveFile (.zxsav)");
+                Check(_methodSaveGameFlow, "ZXGame.SaveGameFlow");
                 Check(_methodLoadGameAndEnter, "ZXGame.LoadGameAndEnter (.zxsav)");
 
                 // 4. Level System Methods
@@ -429,10 +440,18 @@ namespace TABCoopMod.Core
                 TypeBuilding = GameAssembly.GetType(ObfuscatedSymbols.Type_Building);
                 _typeEntityBonusCreation = GameAssembly.GetType("ZX.Commands.EntityBonusCreation");
                 _typeExtractFromSlot = GameAssembly.GetType("ZX.Commands.ExtractFromUnitHolderSlot");
+                _typeContractMercenary = GameAssembly.GetType(ObfuscatedSymbols.Type_ContractMercenary);
+                TypeTheInn = GameAssembly.GetType(ObfuscatedSymbols.Type_TheInn);
                 _propBonusCmdNSlot = _typeEntityBonusCreation?.GetProperty("NSlot", BindingFlags.Public | BindingFlags.Instance);
                 _propBonusCmdTemplate = _typeEntityBonusCreation?.GetProperty("EntityTemplate", BindingFlags.Public | BindingFlags.Instance);
                 _propBonusCmdEntity = _typeEntityBonusCreation?.GetProperty("Entity", BindingFlags.Public | BindingFlags.Instance);
                 _propExtractCmdNSlot = _typeExtractFromSlot?.GetProperty("NSlot", BindingFlags.Public | BindingFlags.Instance);
+                _propMercCmdNSlot = _typeContractMercenary?.GetProperty("NSlot", BindingFlags.Public | BindingFlags.Instance);
+                _propMercCmdTemplate = _typeContractMercenary?.GetProperty("EntityTemplate", BindingFlags.Public | BindingFlags.Instance);
+                _propMercCmdEntity = _typeContractMercenary?.GetProperty("Entity", BindingFlags.Public | BindingFlags.Instance);
+                _mTheInnGetMercenaries = TypeTheInn != null
+                    ? AccessTools.Method(TypeTheInn, ObfuscatedSymbols.Method_TheInn_GetMercenaries, Type.EmptyTypes)
+                    : null;
                 _propCmdableAvailableCmds = typeof(CCommandable).GetProperty("AvailableCommands", BindingFlags.Public | BindingFlags.Instance);
                 _fieldZXGameAllCommands = TypeZXGame?.GetField(ObfuscatedSymbols.Field_ZXGame_AllCommandsList, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
                 _methodLevelStateConsumeBonus = AccessTools.Method(typeof(ZXLevelState), ObfuscatedSymbols.Method_ZXLevelState_ConsumeBonus, new[] { typeof(DXEntityTemplate) });
@@ -457,6 +476,9 @@ namespace TABCoopMod.Core
                 Check(TypeBuilding, "Type ZX.Entities.Building");
                 Check(_typeEntityBonusCreation, "Type ZX.Commands.EntityBonusCreation");
                 Check(_typeExtractFromSlot, "Type ZX.Commands.ExtractFromUnitHolderSlot");
+                Check(_typeContractMercenary, "Type ZX.Commands.ContractMercenary");
+                Check(TypeTheInn, "Type ZX.Entities.TheInn");
+                Check(_mTheInnGetMercenaries, "TheInn.GetMercenaries");
                 Check(_methodLevelStateConsumeBonus, "ZXLevelState.ConsumeBonus");
                 Check(_methodPlaceBuilding, "Build.PlaceBuilding");
                 Check(_methodGetTemplateFromEntityType, "ZXGame.GetTemplateFromEntityType");
@@ -776,12 +798,14 @@ namespace TABCoopMod.Core
                 {
                     _propLevelStateExtraWorkers = AccessTools.Property(lsType, "CommandCenterExtraWorkers");
                     _propLevelStateExtraFood = AccessTools.Property(lsType, "CommandCenterExtraFood");
+                    _methodLevelStateRecalcResources = AccessTools.Method(lsType, ObfuscatedSymbols.Method_ZXLevelState_RecalcResources, Type.EmptyTypes);
                     _fieldLevelStateCachedCC = AccessTools.Field(lsType, ObfuscatedSymbols.Field_ZXLevelState_CachedCC);
                     _methodLevelStateRefreshCCCell = AccessTools.Method(lsType, ObfuscatedSymbols.Method_ZXLevelState_RefreshCCCell, Type.EmptyTypes);
                     _propLevelStateCurrentCCCell = AccessTools.Property(lsType, "CurrentCommandCenterCell");
                     _propLevelStateInfectedDestiny = AccessTools.Property(lsType, "DefaultCellInfectedDestiny");
                     _propLevelStateScriptVars = AccessTools.Property(lsType, "ScriptVariables");
                 }
+                _propGameStateRandom = _typeZXGameState?.GetProperty("Random", BindingFlags.Public | BindingFlags.Instance);
 
                 _typeZXSystemMapLayers = GameAssembly.GetType(ObfuscatedSymbols.Type_ZXSystemMapLayers);
                 if (_typeZXSystemMapLayers != null)
@@ -1059,6 +1083,8 @@ namespace TABCoopMod.Core
                 Check(_propLevelEventAllInfectedToCC, "ZXLevelEvent.AllInfectedToCommandCenter");
                 Check(_propLevelStateExtraWorkers, "ZXLevelState.CommandCenterExtraWorkers");
                 Check(_propLevelStateExtraFood, "ZXLevelState.CommandCenterExtraFood");
+                Check(_methodLevelStateRecalcResources, "ZXLevelState.RecalcResources");
+                Check(_propGameStateRandom, "ZXGameState.Random");
                 Check(_methodLevelSysCapturePanorama, "ZXSystemGameLevel.CapturePanorama");
                 Check(_methodLevelSysEnterGameView, "ZXSystemGameLevel.EnterGameView");
                 Check(_propLevelStateEndStatus, "ZXLevelState.EndStatus");
@@ -1446,15 +1472,82 @@ namespace TABCoopMod.Core
         public static string Localize(string key) => _mLocalize != null ? (string)_mLocalize.Invoke(null, new object[] { key }) : key;
         public static string GetSavesDirectory() => (string)_mGetSavesDir?.Invoke(null, null);
 
+        public static string CurrentGameStateName
+        {
+            get
+            {
+                try
+                {
+                    var gs = CurrentGameStateObject;
+                    if (gs == null || _typeZXGameState == null) return null;
+                    return AccessTools.Property(_typeZXGameState, "Name")?.GetValue(gs, null) as string;
+                }
+                catch { return null; }
+            }
+            set
+            {
+                try
+                {
+                    var gs = CurrentGameStateObject;
+                    if (gs == null || _typeZXGameState == null) return;
+                    var prop = AccessTools.Property(_typeZXGameState, "Name");
+                    if (prop != null && prop.CanWrite)
+                        prop.SetValue(gs, value, null);
+                }
+                catch { }
+            }
+        }
+
         public static void WriteSaveFile(string fullFilePath)
         {
             var game = _mZXGameCurrent.Invoke(null, null);
             var ls = CurrentLevelState;
             if (ls != null)
             {
+                if (Sync.CoopSessionManager.IsMultiFactionActive || Sync.FactionOwnershipTracker.IsInitialized)
+                    Sync.FactionOwnershipTracker.SaveToLevelScriptVariables();
                 AccessTools.Method(typeof(ZXLevelState), ObfuscatedSymbols.Method_ZXLevelState_SaveTimeState)?.Invoke(ls, null);
             }
             _methodWriteSaveFile.Invoke(game, new object[] { fullFilePath });
+        }
+
+        public static bool SaveCurrentLevelAndExit(string saveName = null)
+        {
+            try
+            {
+                var game = _mZXGameCurrent?.Invoke(null, null);
+                var gs = CurrentGameStateObject;
+                if (game == null || gs == null || _methodSaveGameFlow == null)
+                    return false;
+
+                string chosenName = !string.IsNullOrWhiteSpace(saveName) ? saveName.Trim() : CurrentGameStateName;
+                if (string.IsNullOrWhiteSpace(chosenName) || string.Equals(chosenName, "coop_host_snapshot", StringComparison.OrdinalIgnoreCase))
+                {
+                    string orig = Sync.CoopSessionManager.HostOriginalSaveName;
+                    chosenName = !string.IsNullOrWhiteSpace(orig) && !string.Equals(orig, "coop_host_snapshot", StringComparison.OrdinalIgnoreCase)
+                        ? orig
+                        : "CoopSave_" + DateTime.Now.ToString("yyyyMMdd_HHmmss");
+                }
+                CurrentGameStateName = chosenName;
+
+                if (DXModalScreen.IsInModal)
+                    DXModalScreen.CloseAll();
+
+                Action onComplete = () =>
+                {
+                    try { ReturnToMainMenu(); }
+                    catch (Exception ex) { ModLogger.Error("[GameBridge] SaveCurrentLevelAndExit ReturnToMainMenu failed", ex); }
+                };
+
+                ModLogger.InfoImmediate($"[GameBridge] Triggering vanilla SaveGameFlow('{chosenName}') and exiting to MainMenu...");
+                _methodSaveGameFlow.Invoke(game, new object[] { chosenName, onComplete, false, true });
+                return true;
+            }
+            catch (Exception ex)
+            {
+                ModLogger.Error("[GameBridge] SaveCurrentLevelAndExit failed", ex);
+                return false;
+            }
         }
 
         public static void LoadSaveFileAndEnter(string fileNameOrPath)
@@ -1630,6 +1723,8 @@ namespace TABCoopMod.Core
         {
             try
             {
+                if (DXModalScreen.IsInModal)
+                    DXModalScreen.CloseAll();
                 DisableCameraIntroAnimation();
                 var game = _mZXGameCurrent?.Invoke(null, null) as DXGame;
                 if (game == null) return;
@@ -2318,15 +2413,27 @@ namespace TABCoopMod.Core
             }
         }
 
-        /// <summary>Re-seeds DXLevel.Current.Random (used by mayor selection / random events).</summary>
+        /// <summary>Re-seeds DXLevel.Current.Random and ZXGameState.Current.Random so Host and Client roll identical mayors, events, and inn mercenaries.</summary>
         public static void SeedLevelRandom(int seed)
         {
             try
             {
                 var level = DXLevel.Current;
-                if (level == null) return;
-                level.Random = new DXRandom(seed);
-                ModLogger.Info($"[GameBridge] Re-seeded DXLevel.Current.Random (seed={seed}).");
+                if (level != null)
+                    level.Random = new DXRandom(seed);
+
+                // TheInn.OnUpdate() rolls mercenary pools from ZXGameState.Current.Random rather than
+                // DXLevel.Current.Random; sync it identically across peers.
+                object gs = CurrentGameStateObject;
+                if (gs != null)
+                {
+                    if (_propGameStateRandom == null)
+                        _propGameStateRandom = _typeZXGameState?.GetProperty("Random", BindingFlags.Public | BindingFlags.Instance);
+                    if (_propGameStateRandom != null && _propGameStateRandom.CanWrite)
+                        _propGameStateRandom.SetValue(gs, new DXRandom(unchecked(seed ^ 0x5A475352)), null);
+                }
+
+                ModLogger.Info($"[GameBridge] Re-seeded DXLevel.Current.Random (seed={seed}) and ZXGameState.Random.");
             }
             catch (Exception ex)
             {
@@ -3314,6 +3421,156 @@ namespace TABCoopMod.Core
             return true;
         }
 
+        [ThreadStatic]
+        private static DXEntity _activeContractMercenaryInn;
+
+        public static DXEntity ActiveContractMercenaryInn
+        {
+            get => _activeContractMercenaryInn;
+            set => _activeContractMercenaryInn = value;
+        }
+
+        public static bool IsTheInnEntity(object entity)
+        {
+            return entity != null && TypeTheInn != null && TypeTheInn.IsInstanceOfType(entity);
+        }
+
+        public static DXEntity GetLocalSelectedTheInn()
+        {
+            if (TypeTheInn == null || _fieldSelectedList == null) return null;
+            foreach (object item in EnumerateSelectedComponents())
+            {
+                DXEntity ent = (item as DXComponent)?.Entity;
+                if (ent != null && !ent.Disposed && TypeTheInn.IsInstanceOfType(ent))
+                    return ent;
+            }
+            return null;
+        }
+
+        public static IList GetTheInnMercenaryTemplates(object innEntity)
+        {
+            if (!IsTheInnEntity(innEntity) || _mTheInnGetMercenaries == null) return null;
+            try { return _mTheInnGetMercenaries.Invoke(innEntity, null) as IList; }
+            catch { return null; }
+        }
+
+        public static int GetTheInnMercenaryCount(object innEntity)
+        {
+            IList list = GetTheInnMercenaryTemplates(innEntity);
+            return list != null ? list.Count : -1;
+        }
+
+        public static bool TriggerFastTheInnMercenaries(object innEntity)
+        {
+            if (!IsTheInnEntity(innEntity) || TypeTheInn == null) return false;
+            try
+            {
+                var propTimeActive = TypeTheInn.GetProperty("TimeActive", BindingFlags.Public | BindingFlags.Instance);
+                var propBuilt = TypeTheInn.GetProperty("GameTimeBuilt", BindingFlags.Public | BindingFlags.Instance);
+                if (propTimeActive == null) return false;
+
+                int intervalDays = 3;
+                object dp = _methodEntityGetDefaultParams?.Invoke(innEntity, null);
+                var propInterval = dp?.GetType().GetProperty("NDaysNewMercenariesInterval", BindingFlags.Public | BindingFlags.Instance);
+                if (propInterval != null)
+                {
+                    int val = Convert.ToInt32(propInterval.GetValue(dp, null));
+                    if (val > 0) intervalDays = val;
+                }
+
+                if (propBuilt != null)
+                {
+                    int curBuilt = Convert.ToInt32(propBuilt.GetValue(innEntity, null));
+                    if (curBuilt == 0)
+                        propBuilt.SetValue(innEntity, Math.Max(1, DXGame.Current?.GameTimeInt ?? 1), null);
+                }
+
+                // NDaysSinceLastMercenaries = (TimeActive / 1.4) / 60000.0 -> intervalDays * 85000 guarantees >= intervalDays.
+                int targetTimeActive = intervalDays * 85000;
+                propTimeActive.SetValue(innEntity, targetTimeActive, null);
+                ModLogger.Info($"[GameBridge] TriggerFastTheInnMercenaries: intervalDays={intervalDays}, set TimeActive={targetTimeActive}");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                ModLogger.Warn($"[GameBridge] TriggerFastTheInnMercenaries failed: {ex.Message}");
+                return false;
+            }
+        }
+
+        public static bool TryGetContractMercenaryInfo(object command, object executor, out int slot, out Type entityType, out DXEntityTemplate template, out int innMercCount)
+        {
+            slot = 0;
+            entityType = null;
+            template = null;
+            innMercCount = -1;
+            if (command == null || _typeContractMercenary == null || !_typeContractMercenary.IsInstanceOfType(command))
+                return false;
+
+            DXEntity prevInn = _activeContractMercenaryInn;
+            if (executor is DXEntity execEnt && IsTheInnEntity(execEnt))
+                _activeContractMercenaryInn = execEnt;
+            try
+            {
+                if (_propMercCmdNSlot != null)
+                    slot = Convert.ToInt32(_propMercCmdNSlot.GetValue(command));
+
+                DXEntity activeInn = _activeContractMercenaryInn;
+                if (activeInn != null)
+                    innMercCount = GetTheInnMercenaryCount(activeInn);
+
+                // Vanilla ContractMercenary.get_EntityTemplate() indexes list[NSlot - 1] whenever
+                // list.Count >= NSlot, so NSlot <= 0 triggers ArgumentOutOfRangeException on list[-1].
+                if (slot <= 0 || (innMercCount >= 0 && slot > innMercCount))
+                    return true;
+
+                template = _propMercCmdTemplate?.GetValue(command) as DXEntityTemplate;
+                DXEntity entity = template?.Entity ?? (_propMercCmdEntity?.GetValue(command) as DXEntity);
+                if (entity != null)
+                    entityType = entity.GetType();
+            }
+            catch { }
+            finally
+            {
+                _activeContractMercenaryInn = prevInn;
+            }
+            return true;
+        }
+
+        public static bool TryResolveSafeContractMercenaryTemplate(object command, out DXEntityTemplate safeTemplate)
+        {
+            safeTemplate = null;
+            if (command == null || _typeContractMercenary == null || !_typeContractMercenary.IsInstanceOfType(command))
+                return false;
+
+            try
+            {
+                int slot = _propMercCmdNSlot != null ? Convert.ToInt32(_propMercCmdNSlot.GetValue(command)) : 0;
+                if (slot <= 0)
+                    return true;
+
+                DXEntity inn = _activeContractMercenaryInn;
+                if (inn == null)
+                {
+                    var mGetInn = _typeContractMercenary.GetProperty("Inn", BindingFlags.Public | BindingFlags.Instance)?.GetGetMethod();
+                    inn = mGetInn?.Invoke(command, null) as DXEntity;
+                }
+                if (inn == null || inn.Disposed)
+                    return true;
+
+                IList mercList = GetTheInnMercenaryTemplates(inn);
+                if (mercList == null || slot > mercList.Count)
+                    return true;
+
+                safeTemplate = mercList[slot - 1] as DXEntityTemplate;
+                return true;
+            }
+            catch
+            {
+                return true;
+            }
+        }
+
         public static bool IsBuildOrBonusCommand(object command, out bool isBonus)
         {
             isBonus = false;
@@ -3404,8 +3661,8 @@ namespace TABCoopMod.Core
 
         /// <summary>
         /// Resolves the command object for ExecuteSingleOrBatchCommand replay.
-        /// Handles slot-indexed commands (EntityBonusCreation and ExtractFromUnitHolderSlot) whose base
-        /// ZXCommand.ID collides across all slots, matching bonus commands by rewarded entity type name.
+        /// Handles slot-indexed commands (EntityBonusCreation, ExtractFromUnitHolderSlot, ContractMercenary)
+        /// whose base ZXCommand.ID collides across all slots.
         /// </summary>
         public static object ResolveReplayCommand(int commandId, string typeOrSlotTag, byte slotIndex, object executor, out bool isSlotSensitive)
         {
@@ -3437,6 +3694,47 @@ namespace TABCoopMod.Core
                 return null;
             }
 
+            if (string.Equals(typeOrSlotTag, ObfuscatedSymbols.Type_ContractMercenary, StringComparison.Ordinal)
+                || typeOrSlotTag.StartsWith("ZX.Commands.ContractMercenary|", StringComparison.Ordinal))
+            {
+                string expectedTypeName = null;
+                int sep = typeOrSlotTag.IndexOf('|');
+                if (sep >= 0 && sep + 1 < typeOrSlotTag.Length)
+                    expectedTypeName = typeOrSlotTag.Substring(sep + 1);
+
+                IList avail = GetAvailableCommandsForExecutor(executor);
+                int innMercCount = GetTheInnMercenaryCount(executor);
+                if (avail != null && slotIndex > 0)
+                {
+                    object fallbackTypeMatch = null;
+                    foreach (object c in avail)
+                    {
+                        if (!TryGetContractMercenaryInfo(c, executor, out int slot, out Type mercType, out _, out int liveCount))
+                            continue;
+                        if (liveCount >= 0)
+                            innMercCount = liveCount;
+                        if (slot <= 0 || mercType == null)
+                            continue;
+
+                        bool typeMatches = string.IsNullOrEmpty(expectedTypeName)
+                            || string.Equals(mercType.FullName, expectedTypeName, StringComparison.Ordinal);
+                        if (!typeMatches)
+                            continue;
+
+                        if (slot == slotIndex)
+                            return c;
+                        if (fallbackTypeMatch == null && !string.IsNullOrEmpty(expectedTypeName))
+                            fallbackTypeMatch = c;
+                    }
+                    if (fallbackTypeMatch != null)
+                        return fallbackTypeMatch;
+                }
+
+                ulong execId = (executor as DXEntity)?.ID ?? 0UL;
+                ModLogger.Warn($"[GameBridge] ResolveReplayCommand(ContractMercenary) unavailable: executor={execId}, slot={slotIndex}, expectedType={expectedTypeName ?? "<any>"}, innMercCount={innMercCount}.");
+                return null;
+            }
+
             // EntityBonusCreation for a Unit (or any non-structure bonus): CommandCenter.#=z0rkMLsM_Q666() populates slots 1..12.
             IList ccAvail = GetAvailableCommandsForExecutor(executor)
                 ?? GetAvailableCommandsForExecutor(GetCommandCenterEntity());
@@ -3457,6 +3755,22 @@ namespace TABCoopMod.Core
                     fallbackMatch = c;
             }
             return fallbackMatch;
+        }
+
+        public static string DescribeCommandRejection(object command, object executor)
+        {
+            if (command == null) return string.Empty;
+            try
+            {
+                bool vis = _methodIsVisibleCmd == null || (bool)_methodIsVisibleCmd.Invoke(command, new[] { executor });
+                bool can = _methodCanExecuteCmd == null || (bool)_methodCanExecuteCmd.Invoke(command, new[] { executor });
+                string err = _fCmdErrorMsg?.GetValue(command) as string;
+                object dp = _mCmdGetDefaultParams?.Invoke(command, null);
+                Type bReq = dp != null ? _pCmdDefBuildingRequisite?.GetValue(dp, null) as Type : null;
+                Type cReq = dp?.GetType().GetProperty("CommandRequisite", BindingFlags.Public | BindingFlags.Instance)?.GetValue(dp, null) as Type;
+                return $" [vis={vis}, can={can}, err={err ?? "null"}, bReq={bReq?.Name ?? "none"}, cReq={cReq?.Name ?? "none"}]";
+            }
+            catch { return string.Empty; }
         }
 
         public static bool CanExecuteCommandOnEntity(object command, object executor)
@@ -3555,6 +3869,7 @@ namespace TABCoopMod.Core
 
                 PointF origPos = templateEntity.Position;
                 SizeF origSize = templateEntity.Size;
+                Point origCell = templateEntity.Cell;
                 try
                 {
                     templateEntity.CellArea = rect;
@@ -3572,6 +3887,8 @@ namespace TABCoopMod.Core
                 {
                     templateEntity.Size = origSize;
                     templateEntity.Position = origPos;
+                    templateEntity.Cell = origCell;
+                    _methodEntityUpdateCellPosition?.Invoke(templateEntity, null);
                 }
             }
             catch (Exception ex)
@@ -3589,6 +3906,9 @@ namespace TABCoopMod.Core
         public static object SuspendLocalBuildCursorEnergyPreview()
         {
             if (_fieldLevelSysBuildAreaCursor == null || _fieldCursorLastEnergyCell == null || _methodCursorClearEnergyPreview == null)
+                return null;
+            int mainId = Determinism.LockstepClock.MainThreadId;
+            if (mainId != 0 && System.Threading.Thread.CurrentThread.ManagedThreadId != mainId)
                 return null;
             try
             {
@@ -3610,6 +3930,9 @@ namespace TABCoopMod.Core
         public static void RestoreLocalBuildCursorEnergyPreview(object cursor)
         {
             if (cursor == null || _methodCursorUpdateVisual == null) return;
+            int mainId = Determinism.LockstepClock.MainThreadId;
+            if (mainId != 0 && System.Threading.Thread.CurrentThread.ManagedThreadId != mainId)
+                return;
             try
             {
                 if (cursor is DXObject obj && obj.Scene != null)
@@ -5634,7 +5957,7 @@ namespace TABCoopMod.Core
             return _methodGetTemplateFromEntityType.Invoke(zxGame, new object[] { entityType }) as DXEntityTemplate;
         }
 
-        public static bool AddLevelStateCommandCenterExtras(int addWorkers, int addFood)
+        public static bool AddLevelStateCommandCenterExtras(int addWorkers, int addFood, int addEnergy = 0)
         {
             object ls = CurrentLevelState;
             if (ls == null || _propLevelStateExtraWorkers == null || _propLevelStateExtraFood == null) return false;
@@ -5649,7 +5972,19 @@ namespace TABCoopMod.Core
                 int curF = (int)_propLevelStateExtraFood.GetValue(ls);
                 _propLevelStateExtraFood.SetValue(ls, curF + addFood);
             }
+            if (addEnergy != 0 && _pLsExtraEnergy != null)
+            {
+                int curE = (int)_pLsExtraEnergy.GetValue(ls);
+                _pLsExtraEnergy.SetValue(ls, curE + addEnergy);
+            }
             return true;
+        }
+
+        public static void RecalcLevelStateResources()
+        {
+            object ls = CurrentLevelState;
+            if (ls == null || _methodLevelStateRecalcResources == null) return;
+            try { _methodLevelStateRecalcResources.Invoke(ls, null); } catch { }
         }
 
         public static void GetLevelStateCommandCenterExtras(out int extraWorkers, out int extraFood)

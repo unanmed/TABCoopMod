@@ -53,10 +53,11 @@ namespace TABCoopMod.Determinism
     [HarmonyPatch]
     public static class DeterministicTaskPatch
     {
-        // Serialize physics position readback (Loop 2: OnNewPositionComputed -> DXWorldGrid.SetNewCellFor)
-        // on the physics thread only (so concurrent render tasks on MainThread are never serialized),
-        // and serialize MapDrawer generation loops. Physics Loop 1 (StartUpdatePhysics) only writes
-        // per-entity Body forces/fields and keeps native DXHelper_Task.For multi-threading across cores.
+        // Serialize both physics loops on the physics thread:
+        // - Loop 1 (StartUpdatePhysics) mutates Body.PhysicMass/Velocity/Force/Position via Chipmunk2D
+        //   cpBodyActivate, which updates shared cpSpace active/sleeping lists and arbiter islands.
+        //   Running Loop 1 across multiple threads causes wakeup-order races and wandering zombie drift.
+        // - Loop 2 (OnNewPositionComputed) reads back positions and updates DXWorldGrid.
         private static bool Active => LockstepClock.IsDeterministicModeActive
             && ((LockstepClock.InPhysicsReadback && LockstepClock.IsPhysicsThreadActive())
                 || LockstepClock.InMapDrawer);
@@ -108,24 +109,10 @@ namespace TABCoopMod.Determinism
                     return false;
                 }
 
-                // Physics Loop 1 (StartUpdatePhysics): replace ~164 small ThreadPool closures (step=200)
-                // with coarse static chunks matching ParallelWorkers (1 = sequential, >1 = fixed W slices).
-                int total = __1 - __0;
-                int workers = Testing.TestHarnessConfig.ParallelWorkers;
-                if (workers > 1 && total >= 512 && !LockstepClock.InPhysicsReadback)
-                {
-                    if (workers > 8) workers = 8;
-                    System.Threading.Tasks.Parallel.For(0, workers, w =>
-                    {
-                        int a = __0 + (int)(((long)total * w) / workers);
-                        int b = __0 + (int)(((long)total * (w + 1)) / workers);
-                        if (a < b) __2(a, b);
-                    });
-                }
-                else
-                {
-                    __2(__0, __1);
-                }
+                // Physics Loop 1 (StartUpdatePhysics) invokes cpBodyActivate on Chipmunk2D cpSpace via
+                // Body_SetMass/Velocity/Force/Position; execute sequentially on the physics thread to keep
+                // island wakeups and body ordering strictly deterministic across Host and Client.
+                __2(__0, __1);
 
                 if (samplePerf)
                 {

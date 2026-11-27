@@ -237,16 +237,19 @@ namespace TABCoopMod.Sync
             var game = DXGame.Current;
             if (reqType == null || game == null) return false;
 
-            foreach (var ent in game.EntitiesOfType(reqType))
+            lock (DXGame.SyncLogic)
             {
-                if (ent == null || ent.Disposed) continue;
-                if (GameBridge.IsBuildingBeingBuilt(ent)) continue;
-                if (!GameBridge.IsPlayerEntity(ent)) continue;
+                foreach (var ent in game.EntitiesOfType(reqType))
+                {
+                    if (ent == null || ent.Disposed) continue;
+                    if (GameBridge.IsBuildingBeingBuilt(ent)) continue;
+                    if (!GameBridge.IsPlayerEntity(ent)) continue;
 
-                byte owner = FactionOwnershipTracker.GetOwner(ent.ID);
-                if (owner >= 1 && owner <= 3 && FactionOwnershipTracker.IsExiled(owner))
-                    continue;
-                return true;
+                    byte owner = FactionOwnershipTracker.GetOwner(ent.ID);
+                    if (owner >= 1 && owner <= 3 && FactionOwnershipTracker.IsExiled(owner))
+                        continue;
+                    return true;
+                }
             }
             return false;
         }
@@ -669,7 +672,7 @@ namespace TABCoopMod.Sync
             if (st == null || st.Phase != WonderPhase.Building) return;
 
             int pct = Math.Max(0, Math.Min(100, returnPctInt));
-            for (byte pid = 1; pid <= PlayerCount; pid++)
+            for (byte pid = 1; pid <= 3; pid++)
             {
                 var contrib = st.PlayerBuildContrib[pid];
                 var ledger = FactionContextManager.GetLedger(pid);

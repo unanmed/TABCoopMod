@@ -59,6 +59,7 @@ namespace TABCoopMod.Networking
         private const double DiscoveryProbeIntervalMs = 120.0;
         private const double DirectTimeoutMs = 5500.0;
         private const double DirectDataStallFallbackMs = 3000.0;
+        private const double DirectBulkStallFallbackMs = 6000.0;
         private const int SIO_UDP_CONNRESET = -1744830452;
 
         private static readonly string[] StunHosts =
@@ -1576,8 +1577,10 @@ namespace TABCoopMod.Networking
                             double dataStallMs = (hasInFlightData && peer.LastDataProgressTs > 0)
                                 ? (nowTs - peer.LastDataProgressTs) * swToMs
                                 : 0.0;
+                            bool onlyBulkStalled = hasInFlightData && peer.CmdTx.InFlight.Count == 0 && silentMs < 2500.0;
+                            double effectiveDataStallMs = onlyBulkStalled ? DirectBulkStallFallbackMs : DirectDataStallFallbackMs;
 
-                            if (silentMs >= DirectTimeoutMs || dataStallMs >= DirectDataStallFallbackMs)
+                            if (silentMs >= DirectTimeoutMs || dataStallMs >= effectiveDataStallMs)
                             {
                                 string reason = silentMs >= DirectTimeoutMs
                                     ? $"path timeout ({silentMs:F0}ms silent)"

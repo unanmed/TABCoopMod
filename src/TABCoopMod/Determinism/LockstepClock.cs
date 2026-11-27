@@ -3451,6 +3451,22 @@ namespace TABCoopMod.Determinism
             RenderVisualInterpolationPatch.UpdateFrameAlpha();
             FlushPendingAsyncTick(DXGame.Current);
         }
+
+        // RenderFrame() runs in parallel with DedicatedSimWorker, but FinishFrame() immediately runs
+        // DXSystem.OnFinishFrame() and ProcessInputEvents(false) (mouse clicks/moves/hotkeys, command UI
+        // CanExecute/IsVisible, Structure diagonal/EntitiesOfType checks, OCellAreaCursor). Flush any in-flight
+        // async tick BEFORE FinishFrame touches simulation collections, FactionContextManager, or templates.
+        [HarmonyPatch(typeof(DXGame), "FinishFrame")]
+        [HarmonyPrefix]
+        public static void FinishFrame_FlushAsyncTick(DXGame __instance)
+        {
+            if (_asyncTickInFlight && !_inFinalizeAsyncTick
+                && LockstepClock.MainThreadId != 0
+                && Thread.CurrentThread.ManagedThreadId == LockstepClock.MainThreadId)
+            {
+                FlushPendingAsyncTick(__instance);
+            }
+        }
     }
 
     /// <summary>

@@ -65,6 +65,21 @@ namespace TABCoopMod.Sync
         public static bool IsMultiFactionActive => IsSessionActive && GameMode == CoopGameMode.MultiFaction;
         public static string HostActionHint { get; private set; } = string.Empty;
         public static bool ShouldOpenLobbyOnMainMenu { get; set; }
+        public static string HostOriginalSaveName { get; private set; } = string.Empty;
+
+        public sealed class DisconnectedPeerReservation
+        {
+            public ulong SteamId64;
+            public string PlayerName;
+            public byte FactionSlot;
+            public double DisconnectedAtTicks;
+        }
+
+        public static readonly List<DisconnectedPeerReservation> DisconnectedMatchPeers = new List<DisconnectedPeerReservation>();
+        public static bool HasDisconnectAlert { get; private set; }
+        public static byte DisconnectAlertSlot { get; private set; }
+        public static string DisconnectAlertPlayerName { get; private set; } = string.Empty;
+        public static bool DisconnectAlertDismissed { get; set; }
 
         // Local loopback network fluctuation simulation (only applies to LocalTcpLoopbackTransport).
         public static bool LocalChaosEnabled { get; private set; }
@@ -92,11 +107,19 @@ namespace TABCoopMod.Sync
 
                 if (!(UnwrapTransport() is LocalTcpLoopbackTransport local)) return false;
                 if (!local.IsLanMode) return true;
-                if (!local.IsHost) return local.IsLoopbackOrPrivateLanTarget;
+                if (!local.IsHost)
+                {
+                    if (!local.IsLoopbackOrPrivateLanTarget) return false;
+                    // Mixed rooms (e.g. LAN + frp WAN) raise InputDelayTicks above 1t, and
+                    // Client-to-Host frp tunnels still appear as 127.0.0.1 despite WAN RTT.
+                    return InputDelayTicks <= MinInputDelayTicks
+                        && (LocalRttToHostMs < 0.0 || LocalRttToHostMs <= 15.0);
+                }
 
                 var peers = Transport.ConnectedPeers;
                 if (peers == null || peers.Count == 0) return false;
 
+                double now = DXHelper_Environment.Ticks;
                 bool hasClient = false;
                 for (int i = 0; i < peers.Count; i++)
                 {
@@ -104,6 +127,13 @@ namespace TABCoopMod.Sync
                     if (p == null || p.PlayerId == 1) continue;
                     hasClient = true;
                     if (!p.IsLocalOrPrivateLan) return false;
+                    if (_peerSmoothedRttMs.TryGetValue(p.PlayerId, out double peerRtt)
+                        && _peerRttSampleTicks.TryGetValue(p.PlayerId, out double sampleTs)
+                        && (now - sampleTs <= RttStalePeerMs || now < sampleTs)
+                        && peerRtt > 15.0)
+                    {
+                        return false;
+                    }
                 }
                 return hasClient;
             }
@@ -293,6 +323,12 @@ namespace TABCoopMod.Sync
         private static double _gateLastWarnTicks = -1.0;
         private const double GateTimeoutMs = 3000.0;
         private static bool _pendingOpenGameMenuAfterPause;
+        private static double _pendingOpenGameMenuRequestedAtTicks = -1.0;
+        private static bool _allowDirectGameMenuOpenOnce;
+        private static bool _coopGameMenuModalOpened;
+        private static double _lastManualResyncRequestTicks = -100000.0;
+        private const double GameMenuPauseWaitTimeoutMs = 1500.0;
+        private const double ManualResyncCooldownMs = 5000.0;
         private static int _hostWaitLastTick = -1;
         private static double _hostWaitLastTickChangeTicks = -1000.0;
         private static double _hostWaitLastLogTicks = -1000.0;
@@ -317,6 +353,8 @@ namespace TABCoopMod.Sync
         private static ulong[][] _pendingResyncSelectionGroups;
         private static bool _lateJoinInProgress;
         private static byte _lateJoinPeerId;
+        private static bool _lateJoinForcedPause;
+        private static bool _lateJoinWasAlreadyPaused;
         private static string _pendingJoinRejectReason;
         public static bool IsHostSnapshotReloadPending => _hostSnapshotReloadPending;
 
@@ -342,6 +380,13 @@ namespace TABCoopMod.Sync
         private static string _incomingCheckContent = string.Empty;
         private static int _incomingRandomSeed = 1337;
         private static long _incomingEntityIdCounter;
+        private static double _lastSnapshotRxTicks = -1.0;
+        private static double _lastSnapshotChunkRequestTicks = -1.0;
+        private static byte[] _activeSnapshotSavBytes;
+        private static int _activeSnapshotTotalChunks;
+        private static string _activeSnapshotCheckContent = string.Empty;
+        private static int _activeSnapshotSeed;
+        private static long _activeSnapshotIdCounter;
 
         // Ally Cursor & Camera State
         public sealed class AllyVisualState
@@ -466,6 +511,143 @@ namespace TABCoopMod.Sync
             public byte OwnerPlayerId;
         }
 
+        private struct ZombieFavorKeepFarFix
+        {
+            public ulong Id;
+            public float X;
+            public float Y;
+        }
+
+        private sealed class PendingZombieFavorAlign
+        {
+            public int Generation;
+            public int Tick;
+            public byte SenderPlayerId;
+            public List<ulong> KillZombieIds;
+            public List<ZombieFavorKeepFarFix> KeepFarFixes;
+        }
+
+        /// <summary>
+        /// Lightweight 16x16 coarse spatial grid of live player units and buildings used to evaluate
+        /// player-favorable zombie position alignment with O(1) pruning for non-frontline zombies.
+        /// </summary>
+        private sealed class PlayerDefenseCoarseGrid
+        {
+            public const int CoarseCellSize = 16;
+            public const float MaxSafeRadiusSq = 18.0f * 18.0f;
+            public const float MinFarAdvantageCells = 0.35f;
+
+            private readonly int _nCells;
+            private readonly int _gridSide;
+            private readonly bool[] _dangerMask;
+            private readonly List<PointF>[] _buckets;
+
+            public PlayerDefenseCoarseGrid(DXGame game, int nCells)
+            {
+                _nCells = Math.Max(32, nCells);
+                _gridSide = (_nCells + CoarseCellSize - 1) / CoarseCellSize;
+                int totalBuckets = _gridSide * _gridSide;
+                _dangerMask = new bool[totalBuckets];
+                _buckets = new List<PointF>[totalBuckets];
+
+                if (game == null) return;
+                lock (DXGame.SyncLogic)
+                {
+                    AddPlayerEntities(game.EntitiesOfType(GameBridge.TypeBuilding));
+                    AddPlayerEntities(game.EntitiesOfType(GameBridge.TypeUnit));
+                }
+            }
+
+            private void AddPlayerEntities(IEnumerable<DXEntity> entities)
+            {
+                if (entities == null) return;
+                foreach (var ent in entities)
+                {
+                    if (ent == null || ent.Disposed) continue;
+                    if (!GameBridge.IsPlayerEntity(ent)) continue;
+
+                    PointF p = ent.Position;
+                    if (float.IsNaN(p.X) || float.IsInfinity(p.X) || float.IsNaN(p.Y) || float.IsInfinity(p.Y)) continue;
+
+                    int gx = Math.Max(0, Math.Min(_gridSide - 1, (int)(p.X / CoarseCellSize)));
+                    int gy = Math.Max(0, Math.Min(_gridSide - 1, (int)(p.Y / CoarseCellSize)));
+                    int idx = gy * _gridSide + gx;
+                    var bucket = _buckets[idx];
+                    if (bucket == null)
+                    {
+                        bucket = new List<PointF>(4);
+                        _buckets[idx] = bucket;
+                    }
+                    bucket.Add(p);
+
+                    int minX = Math.Max(0, gx - 1);
+                    int maxX = Math.Min(_gridSide - 1, gx + 1);
+                    int minY = Math.Max(0, gy - 1);
+                    int maxY = Math.Min(_gridSide - 1, gy + 1);
+                    for (int ny = minY; ny <= maxY; ny++)
+                    {
+                        int row = ny * _gridSide;
+                        for (int nx = minX; nx <= maxX; nx++)
+                            _dangerMask[row + nx] = true;
+                    }
+                }
+            }
+
+            public bool HasDangerNear(float x, float y)
+            {
+                int gx = Math.Max(0, Math.Min(_gridSide - 1, (int)(x / CoarseCellSize)));
+                int gy = Math.Max(0, Math.Min(_gridSide - 1, (int)(y / CoarseCellSize)));
+                return _dangerMask[gy * _gridSide + gx];
+            }
+
+            public bool TryGetMinDistSqToPlayer(float x, float y, out float minDistSq)
+            {
+                minDistSq = float.MaxValue;
+                int gx = Math.Max(0, Math.Min(_gridSide - 1, (int)(x / CoarseCellSize)));
+                int gy = Math.Max(0, Math.Min(_gridSide - 1, (int)(y / CoarseCellSize)));
+                if (!_dangerMask[gy * _gridSide + gx])
+                    return false;
+
+                int minX = Math.Max(0, gx - 1);
+                int maxX = Math.Min(_gridSide - 1, gx + 1);
+                int minY = Math.Max(0, gy - 1);
+                int maxY = Math.Min(_gridSide - 1, gy + 1);
+                bool found = false;
+                for (int ny = minY; ny <= maxY; ny++)
+                {
+                    int row = ny * _gridSide;
+                    for (int nx = minX; nx <= maxX; nx++)
+                    {
+                        var bucket = _buckets[row + nx];
+                        if (bucket == null) continue;
+                        for (int i = 0; i < bucket.Count; i++)
+                        {
+                            float dx = bucket[i].X - x;
+                            float dy = bucket[i].Y - y;
+                            float d2 = dx * dx + dy * dy;
+                            if (d2 < minDistSq)
+                            {
+                                minDistSq = d2;
+                                found = true;
+                            }
+                        }
+                    }
+                }
+                return found;
+            }
+
+            public static bool IsZombieFallbackCellWalkable(float x, float y, int nCells)
+            {
+                if (float.IsNaN(x) || float.IsInfinity(x) || float.IsNaN(y) || float.IsInfinity(y))
+                    return false;
+                int cx = (int)x;
+                int cy = (int)y;
+                if (cx < 1 || cy < 1 || cx >= nCells - 1 || cy >= nCells - 1)
+                    return false;
+                return DXWorldGrid.ExistCell(cx, cy) && DXWorldGrid.IsCellAvailable(cx, cy);
+            }
+        }
+
         private struct DynamicSpawnSample
         {
             public ulong Id;
@@ -513,6 +695,9 @@ namespace TABCoopMod.Sync
             public Dictionary<ulong, DynamicTargetSample> TargetFixes;
             public HashSet<ulong> DriftedPosIds15;
             public List<DynamicSpawnSample> DynamicSpawns;
+            public List<ulong> FavorKillZombiesForHost;
+            public int BaselineAckSeq;
+            public bool SkipApplyBaselineOnly;
         }
 
         public static readonly Dictionary<byte, AllyVisualState> AllyStates = new Dictionary<byte, AllyVisualState>();
@@ -523,6 +708,11 @@ namespace TABCoopMod.Sync
             new ConcurrentQueue<PendingPosAlignApply>();
         private static readonly ConcurrentQueue<PendingReverseAlignApply> _incomingReverseAlignQueue =
             new ConcurrentQueue<PendingReverseAlignApply>();
+        private static readonly ConcurrentQueue<PendingZombieFavorAlign> _incomingZombieFavorAlignQueue =
+            new ConcurrentQueue<PendingZombieFavorAlign>();
+        private static readonly object _clientEpochZombieLock = new object();
+        private static readonly HashSet<ulong> _clientLastEpochAliveZombies = new HashSet<ulong>();
+        private static int _clientLastEpochZombieTick = -1;
         private static readonly object _unitOwnershipSync = new object();
         private static readonly Dictionary<ulong, UnitOwnershipEntry> _unitOwnership =
             new Dictionary<ulong, UnitOwnershipEntry>();
@@ -565,6 +755,7 @@ namespace TABCoopMod.Sync
 
         private const byte SessionStartProtoFlag_CompactBinary = 1 << 0;
         private const byte SessionStartProtoFlag_AdaptivePhysIter = 1 << 1;
+        private const byte SessionStartProtoFlag_StartPaused = 1 << 2;
         private static bool _useCompactWireProtocol;
         public static bool SyncedAdaptivePhysicsIterations { get; private set; }
         private static PointF _lastSentCursorWorldPos = new PointF(-9999f, -9999f);
@@ -599,8 +790,12 @@ namespace TABCoopMod.Sync
             new Dictionary<byte, (int, Dictionary<ulong, DriftBaselineEntry>)>();
         private static readonly Dictionary<int, HostPendingBaseline> _hostPendingBaselinesBySeq =
             new Dictionary<int, HostPendingBaseline>();
+        private const int ClientDriftBaselineHistoryLimit = 8;
         private static int _clientPrevDriftSeq;
         private static Dictionary<ulong, StateHasher.EntityPosSample> _clientPrevDriftSamples;
+        private static readonly Dictionary<int, Dictionary<ulong, StateHasher.EntityPosSample>> _clientDriftBaselinesBySeq =
+            new Dictionary<int, Dictionary<ulong, StateHasher.EntityPosSample>>();
+        private static readonly Queue<int> _clientDriftBaselineOrder = new Queue<int>();
 
         private static ushort QuantizeCursorCoord(float value)
         {
@@ -706,6 +901,8 @@ namespace TABCoopMod.Sync
                 _hostPendingBaselinesBySeq.Clear();
                 _clientPrevDriftSeq = 0;
                 _clientPrevDriftSamples = null;
+                _clientDriftBaselinesBySeq.Clear();
+                _clientDriftBaselineOrder.Clear();
             }
             _lastCheckedSimTick = -1;
             _peerLastPosSyncSentTicks.Clear();
@@ -743,6 +940,12 @@ namespace TABCoopMod.Sync
             while (_outgoingPosSyncQueue.TryDequeue(out _)) { }
             while (_incomingPosAlignQueue.TryDequeue(out _)) { }
             while (_incomingReverseAlignQueue.TryDequeue(out _)) { }
+            while (_incomingZombieFavorAlignQueue.TryDequeue(out _)) { }
+            lock (_clientEpochZombieLock)
+            {
+                _clientLastEpochAliveZombies.Clear();
+                _clientLastEpochZombieTick = -1;
+            }
             lock (_unitOwnershipSync) _unitOwnership.Clear();
             _peerLastSimTick.Clear();
             _peerLastSimTickWallMs.Clear();
@@ -1021,7 +1224,213 @@ namespace TABCoopMod.Sync
                 w.Write((byte)GameMode);
                 w.Write((byte)DefeatRule);
                 w.Write((byte)SpawnMode);
+                w.Write((byte)_lobbyRoster.Count);
+                foreach (var p in _lobbyRoster)
+                    w.Write(p.EffectiveFactionSlot);
             });
+            SyncLocalFactionSlotFromRoster();
+        }
+
+        public static byte GetFactionSlotForTransportId(byte transportPlayerId)
+        {
+            if (transportPlayerId == 0) return 1;
+            for (int i = 0; i < _lobbyRoster.Count; i++)
+            {
+                var p = _lobbyRoster[i];
+                if (p != null && p.PlayerId == transportPlayerId)
+                    return p.EffectiveFactionSlot;
+            }
+            var peers = Transport?.ConnectedPeers;
+            if (peers != null)
+            {
+                for (int i = 0; i < peers.Count; i++)
+                {
+                    var p = peers[i];
+                    if (p != null && p.PlayerId == transportPlayerId)
+                        return p.EffectiveFactionSlot;
+                }
+            }
+            return transportPlayerId;
+        }
+
+        public static byte[] GetOccupiedFactionSlotsSorted()
+        {
+            var set = new SortedSet<byte>();
+            if (IsSessionActive)
+            {
+                foreach (var p in GetEffectivePeers())
+                {
+                    if (p == null) continue;
+                    byte s = p.EffectiveFactionSlot;
+                    if (s >= 1 && s <= 3) set.Add(s);
+                }
+            }
+            if (set.Count == 0)
+            {
+                byte fallback = (byte)(CommandInterceptor.LocalPlayerId >= 1 && CommandInterceptor.LocalPlayerId <= 3 ? CommandInterceptor.LocalPlayerId : 1);
+                set.Add(fallback);
+            }
+            var arr = new byte[set.Count];
+            set.CopyTo(arr);
+            return arr;
+        }
+
+        private static void SyncLocalFactionSlotFromRoster()
+        {
+            if (Transport == null || Transport.LocalPlayerId == 0)
+            {
+                CommandInterceptor.LocalPlayerId = 1;
+                return;
+            }
+            byte slot = GetFactionSlotForTransportId(Transport.LocalPlayerId);
+            if (slot < 1 || slot > 3) slot = Transport.LocalPlayerId;
+            if (CommandInterceptor.LocalPlayerId != slot)
+            {
+                CommandInterceptor.LocalPlayerId = slot;
+                ModLogger.Info($"[CoopSessionManager] Local FactionSlot bound to P{slot} (TransportPlayerId={Transport.LocalPlayerId}).");
+            }
+        }
+
+        private static byte AllocateFreeFactionSlotForJoiningPeer(PeerInfo peer, byte? preferredSlot = null)
+        {
+            var used = new HashSet<byte>();
+            for (int i = 0; i < _lobbyRoster.Count; i++)
+            {
+                var p = _lobbyRoster[i];
+                if (p == null || (peer != null && p.PlayerId == peer.PlayerId)) continue;
+                used.Add(p.EffectiveFactionSlot);
+            }
+
+            if (preferredSlot.HasValue && preferredSlot.Value >= 1 && preferredSlot.Value <= 3 && !used.Contains(preferredSlot.Value))
+                return preferredSlot.Value;
+            if (peer != null && peer.FactionSlot >= 1 && peer.FactionSlot <= 3 && !used.Contains(peer.FactionSlot))
+                return peer.FactionSlot;
+            if (peer != null && peer.PlayerId >= 1 && peer.PlayerId <= 3 && !used.Contains(peer.PlayerId))
+                return peer.PlayerId;
+
+            for (byte s = 1; s <= 3; s++)
+            {
+                if (!used.Contains(s)) return s;
+            }
+            return peer != null && peer.PlayerId >= 1 ? peer.PlayerId : (byte)1;
+        }
+
+        public static void RequestSeatSwap(byte targetSlot)
+        {
+            if (targetSlot < 1 || targetSlot > 3) return;
+            if (!IsSessionActive || Transport == null || IsInSyncedLevel || RoomPhase != LobbyRoomPhase.InLobby)
+                return;
+            if (Transport.LocalPlayerId == 0) return;
+
+            if (Transport.IsHost)
+            {
+                ApplyHostSeatSwap(Transport.LocalPlayerId, targetSlot);
+                return;
+            }
+
+            Transport.SendToPeer(1, SendChannel.ReliableCommand, PacketType.LobbySeatSwapRequest, w =>
+            {
+                w.Write(targetSlot);
+            });
+        }
+
+        private static void ApplyHostSeatSwap(byte requesterTransportId, byte targetSlot)
+        {
+            if (!IsSessionActive || Transport == null || !Transport.IsHost) return;
+            if (IsInSyncedLevel || RoomPhase != LobbyRoomPhase.InLobby || targetSlot < 1 || targetSlot > 3) return;
+
+            var requester = _lobbyRoster.Find(p => p.PlayerId == requesterTransportId);
+            if (requester == null) return;
+            byte oldSlot = requester.EffectiveFactionSlot;
+            if (oldSlot == targetSlot) return;
+
+            var occupant = _lobbyRoster.Find(p => p.PlayerId != requesterTransportId && p.EffectiveFactionSlot == targetSlot);
+            if (occupant != null)
+                occupant.FactionSlot = oldSlot;
+            requester.FactionSlot = targetSlot;
+
+            ModLogger.Info($"[CoopSessionManager] Lobby seat swap: Transport P{requesterTransportId} ({requester.PlayerName}) P{oldSlot} -> P{targetSlot}" +
+                (occupant != null ? $" (swapped with Transport P{occupant.PlayerId})" : " (empty slot)"));
+            BroadcastLobbyRoster();
+            LobbyStateChanged?.Invoke();
+        }
+
+        public static void DismissDisconnectAlert()
+        {
+            DisconnectAlertDismissed = true;
+        }
+
+        public static void ClearDisconnectAlertAndReservations()
+        {
+            DisconnectedMatchPeers.Clear();
+            HasDisconnectAlert = false;
+            DisconnectAlertSlot = 0;
+            DisconnectAlertPlayerName = string.Empty;
+            DisconnectAlertDismissed = false;
+            UI.DisconnectNoticeOverlay.Reset();
+        }
+
+        private static void EnsureDisconnectAlertUpdated(bool broadcastToClients = false)
+        {
+            if (DisconnectedMatchPeers.Count == 0)
+            {
+                bool wasActive = HasDisconnectAlert;
+                HasDisconnectAlert = false;
+                DisconnectAlertSlot = 0;
+                DisconnectAlertPlayerName = string.Empty;
+                DisconnectAlertDismissed = false;
+                if (wasActive && broadcastToClients)
+                    BroadcastDisconnectNotice(false, 0, string.Empty);
+                return;
+            }
+
+            var latest = DisconnectedMatchPeers[DisconnectedMatchPeers.Count - 1];
+            HasDisconnectAlert = true;
+            DisconnectAlertSlot = latest.FactionSlot;
+            DisconnectAlertPlayerName = latest.PlayerName ?? $"Player {latest.FactionSlot}";
+            DisconnectAlertDismissed = false;
+            if (broadcastToClients)
+                BroadcastDisconnectNotice(true, DisconnectAlertSlot, DisconnectAlertPlayerName);
+        }
+
+        private static void BroadcastDisconnectNotice(bool active, byte slot, string playerName)
+        {
+            if (Transport == null || !Transport.IsHost || !IsSessionActive) return;
+            Transport.Broadcast(SendChannel.ReliableCommand, PacketType.PeerDisconnectNotice, w =>
+            {
+                w.Write(active);
+                w.Write(slot);
+                w.Write(playerName ?? string.Empty);
+            });
+        }
+
+        public static void TogglePauseForDisconnectWait()
+        {
+            if (!IsSessionActive || !IsInSyncedLevel) return;
+            bool curPaused = LockstepClock.PausedBySession || (DXGame.Current != null && DXGame.Current.Paused);
+            bool nextPaused = !curPaused;
+
+            if (Transport == null || Transport.ConnectedPeers == null || Transport.ConnectedPeers.Count <= 1)
+            {
+                // Host is alone waiting for disconnect reconnect; toggle session pause immediately.
+                LockstepClock.SetSessionPause(nextPaused);
+                if (DXGame.Current != null)
+                    DXGame.Current.Paused = nextPaused;
+                GameBridge.ShowTopBanner(
+                    nextPaused ? "已暂停游戏，等待断线玩家通过 Steam 加入重连" : "已恢复游戏",
+                    nextPaused ? Color.Gold : Color.SpringGreen,
+                    3000);
+                return;
+            }
+
+            PauseSyncController.RequestPause(nextPaused);
+        }
+
+        public static bool HostSaveAndExitFromAlert(string overrideSaveName = null)
+        {
+            if (!IsSessionActive || Transport == null || !Transport.IsHost)
+                return false;
+            return GameBridge.SaveCurrentLevelAndExit(overrideSaveName);
         }
 
         public static void StartHostSession(bool useLoopback, int lanPort = 0)
@@ -1097,7 +1506,7 @@ namespace TABCoopMod.Sync
             LobbyStateChanged?.Invoke();
         }
 
-        public static void StopSession()
+        public static void StopSession(bool preserveRejectReason = false)
         {
             CommandInterceptor.IsInterceptionEnabled = false;
             CommandInterceptor.OnLocalCommandCaptured = null;
@@ -1133,7 +1542,12 @@ namespace TABCoopMod.Sync
             UI.MultiFactionPanel.Reset();
             UI.ManualSyncButton.Reset();
             UI.PerfOverlayRenderer.Reset();
+            ClearDisconnectAlertAndReservations();
             _pendingOpenGameMenuAfterPause = false;
+            _pendingOpenGameMenuRequestedAtTicks = -1.0;
+            _allowDirectGameMenuOpenOnce = false;
+            _coopGameMenuModalOpened = false;
+            _lastManualResyncRequestTicks = -100000.0;
             UI.AllyOverlayRenderer.ClearUnitFactionRings();
             _hostLastBroadcastSimTick = -1;
             _hostLastBroadcastTargetTick = -1;
@@ -1167,13 +1581,18 @@ namespace TABCoopMod.Sync
             _pendingClientSnapshotLoadPath = null;
             _lateJoinInProgress = false;
             _lateJoinPeerId = 0;
-            _pendingJoinRejectReason = null;
+            _lateJoinForcedPause = false;
+            if (!preserveRejectReason)
+                _pendingJoinRejectReason = null;
             _pendingBroadcastSavBytes = null;
             _pendingBroadcastChkText = null;
             _kickingLoadFade = false;
             _loadFadeKickStartTicks = -1.0;
             _incomingChunks.Clear();
             _expectedChunks = 0;
+            _lastSnapshotRxTicks = -1.0;
+            _lastSnapshotChunkRequestTicks = -1.0;
+            ClearActiveSnapshotCache();
             _networkGate = new TurnInputTickGate();
             DXGame.LastGameTimeIAUpdate = 0.0;
             DXPhysicWorld.LastGameTimeUpdatePhysics = 0.0;
@@ -1225,7 +1644,12 @@ namespace TABCoopMod.Sync
             UI.MultiFactionPanel.Reset();
             UI.ManualSyncButton.Reset();
             UI.PerfOverlayRenderer.Reset();
+            ClearDisconnectAlertAndReservations();
             _pendingOpenGameMenuAfterPause = false;
+            _pendingOpenGameMenuRequestedAtTicks = -1.0;
+            _allowDirectGameMenuOpenOnce = false;
+            _coopGameMenuModalOpened = false;
+            _lastManualResyncRequestTicks = -100000.0;
             UI.AllyOverlayRenderer.ClearUnitFactionRings();
             _hostLastBroadcastSimTick = -1;
             _hostLastBroadcastTargetTick = -1;
@@ -1257,6 +1681,7 @@ namespace TABCoopMod.Sync
             _pendingClientSnapshotLoadPath = null;
             _lateJoinInProgress = false;
             _lateJoinPeerId = 0;
+            _lateJoinForcedPause = false;
             _pendingJoinRejectReason = null;
             _pendingBroadcastSavBytes = null;
             _pendingBroadcastChkText = null;
@@ -1264,6 +1689,9 @@ namespace TABCoopMod.Sync
             _loadFadeKickStartTicks = -1.0;
             _incomingChunks.Clear();
             _expectedChunks = 0;
+            _lastSnapshotRxTicks = -1.0;
+            _lastSnapshotChunkRequestTicks = -1.0;
+            ClearActiveSnapshotCache();
             _networkGate = new TurnInputTickGate();
             DXGame.LastGameTimeIAUpdate = 0.0;
             DXPhysicWorld.LastGameTimeUpdatePhysics = 0.0;
@@ -1352,38 +1780,48 @@ namespace TABCoopMod.Sync
         {
             Transport.OnPeerConnected += peer =>
             {
-                CommandInterceptor.LocalPlayerId = Transport.LocalPlayerId;
-                ModLogger.Info($"[CoopSessionManager] Peer connected: {peer?.PlayerName} (PlayerId={peer?.PlayerId}, LocalId={Transport.LocalPlayerId})");
-                GameBridge.ShowTopBanner($"Co-op Peer Connected: {peer?.PlayerName}", Color.SpringGreen, 3000);
+                ModLogger.Info($"[CoopSessionManager] Peer connected: {peer?.PlayerName} (PlayerId={peer?.PlayerId}, Slot={peer?.EffectiveFactionSlot}, LocalId={Transport.LocalPlayerId})");
 
                 if (Transport.IsHost)
                 {
-                    if (peer != null)
+                    if (GameBridge.CurrentLevelState != null && peer != null)
                     {
-                        _lobbyRoster.RemoveAll(p =>
-                            p.PlayerId == peer.PlayerId
-                            || (peer.SteamId64 != 0 && p.SteamId64 == peer.SteamId64 && p.PlayerId != 1));
-                        _lobbyRoster.Add(new PeerInfo
+                        bool isDuplicateActivePeer = peer.SteamId64 != 0 && _lobbyRoster.Exists(p =>
+                            p.PlayerId == peer.PlayerId && p.SteamId64 == peer.SteamId64);
+                        if (isDuplicateActivePeer
+                            && ((_lateJoinInProgress && _lateJoinPeerId == peer.PlayerId)
+                                || _pendingHostSnapshotExport
+                                || _awaitingClientSnapshotAck
+                                || _hostSnapshotReloadPending))
                         {
-                            PlayerId = peer.PlayerId,
-                            PlayerName = peer.PlayerName,
-                            SteamId64 = peer.SteamId64,
-                            IsReady = peer.PlayerId == 1 || peer.IsReady,
-                            IsLocalOrPrivateLan = peer.IsLocalOrPrivateLan
-                        });
-                        _lobbyRoster.Sort((a, b) => a.PlayerId.CompareTo(b.PlayerId));
-                    }
-                    BroadcastLobbyRoster();
+                            ModLogger.Info($"[LateJoin] Ignoring duplicate handshake for active P{peer.PlayerId} while sync is in progress.");
+                            return;
+                        }
 
-                    // If Host is already inside a level when a peer connects, start a late join.
-                    if (GameBridge.CurrentLevelState != null)
+                        if (!TryAcceptLateJoin(peer))
+                        {
+                            LobbyStateChanged?.Invoke();
+                            return;
+                        }
+
+                        UpsertHostLobbyPeer(peer, ready: true, forcedFactionSlot: peer.FactionSlot);
+                        RemoveDisconnectedReservationForPeer(peer);
+                        EnsureDisconnectAlertUpdated(broadcastToClients: true);
+                        BroadcastLobbyRoster();
+                        GameBridge.ShowTopBanner($"P{peer.EffectiveFactionSlot} ({peer.PlayerName}) 正在重连加入，正在同步战局...", Color.Cyan, 4000);
+                        RequestSnapshotBroadcast();
+                    }
+                    else
                     {
-                        if (TryAcceptLateJoin(peer))
-                            RequestSnapshotBroadcast();
+                        if (peer != null)
+                            UpsertHostLobbyPeer(peer, ready: peer.PlayerId == 1 || peer.IsReady);
+                        GameBridge.ShowTopBanner($"Co-op Peer Connected: {peer?.PlayerName}", Color.SpringGreen, 3000);
+                        BroadcastLobbyRoster();
                     }
                 }
                 else
                 {
+                    GameBridge.ShowTopBanner($"Co-op Peer Connected: {peer?.PlayerName}", Color.SpringGreen, 3000);
                     if (Transport.ConnectedPeers != null && Transport.ConnectedPeers.Count > 0)
                     {
                         _lobbyRoster.Clear();
@@ -1392,6 +1830,7 @@ namespace TABCoopMod.Sync
                             _lobbyRoster.Add(new PeerInfo
                             {
                                 PlayerId = p.PlayerId,
+                                FactionSlot = p.EffectiveFactionSlot,
                                 PlayerName = p.PlayerName,
                                 SteamId64 = p.SteamId64,
                                 IsReady = p.IsReady,
@@ -1399,13 +1838,19 @@ namespace TABCoopMod.Sync
                             });
                         }
                     }
+                    SyncLocalFactionSlotFromRoster();
                 }
                 LobbyStateChanged?.Invoke();
             };
 
             Transport.OnPeerDisconnected += playerId =>
             {
-                AllyStates.Remove(playerId);
+                var deadPeer = _lobbyRoster.Find(p => p.PlayerId == playerId);
+                byte deadSlot = deadPeer?.EffectiveFactionSlot ?? playerId;
+                string deadName = !string.IsNullOrEmpty(deadPeer?.PlayerName) ? deadPeer.PlayerName : $"Player {deadSlot}";
+                ulong deadSteamId = deadPeer?.SteamId64 ?? 0UL;
+
+                AllyStates.Remove(deadSlot);
                 _peerSmoothedRttMs.Remove(playerId);
                 _peerRttSampleTicks.Remove(playerId);
                 _syncedRoomPeerLinks.Remove(playerId);
@@ -1417,8 +1862,17 @@ namespace TABCoopMod.Sync
                 _clientSnapshotAckPeers.Remove(playerId);
                 if (playerId == _lateJoinPeerId)
                 {
+                    bool abortedLateJoinExport = _lateJoinInProgress && _pendingHostSnapshotExport;
                     _lateJoinInProgress = false;
                     _lateJoinPeerId = 0;
+                    if (abortedLateJoinExport)
+                    {
+                        _pendingHostSnapshotExport = false;
+                        if (_lateJoinForcedPause)
+                            LockstepClock.SetSessionPause(false);
+                    }
+                    _lateJoinForcedPause = false;
+                    _lateJoinWasAlreadyPaused = false;
                 }
                 _lobbyRoster.RemoveAll(p => p.PlayerId == playerId);
                 if (Transport != null && Transport.IsHost)
@@ -1426,8 +1880,33 @@ namespace TABCoopMod.Sync
 
                 if (Transport != null && Transport.IsHost)
                 {
+                    bool inActiveMatch = playerId != 1
+                        && (IsInSyncedLevel || (GameBridge.CurrentLevelState != null && !GameBridge.IsLevelEnded()));
+                    if (inActiveMatch)
+                    {
+                        DisconnectedMatchPeers.RemoveAll(r =>
+                            (deadSteamId != 0UL && r.SteamId64 == deadSteamId)
+                            || r.FactionSlot == deadSlot);
+                        DisconnectedMatchPeers.Add(new DisconnectedPeerReservation
+                        {
+                            SteamId64 = deadSteamId,
+                            PlayerName = deadName,
+                            FactionSlot = deadSlot,
+                            DisconnectedAtTicks = DXHelper_Environment.Ticks
+                        });
+                        if (UnwrapTransport() is SteamP2PTransport steamTrans)
+                            steamTrans.SetLobbyJoinable(true);
+
+                        EnsureDisconnectAlertUpdated(broadcastToClients: true);
+                        ModLogger.Warn($"[Disconnect] Mid-game peer {deadName} (TransportP{playerId}, FactionSlot P{deadSlot}) disconnected. Ownership preserved; slot P{deadSlot} reserved for Steam rejoin.");
+                        GameBridge.ShowTopBanner($"玩家 {deadName} (P{deadSlot}) 已断线（基地已保留）！可暂停等待 Steam 加入重连或保存退出", Color.OrangeRed, 6000);
+                    }
+                    else
+                    {
+                        GameBridge.ShowTopBanner($"Player {deadSlot} Disconnected", Color.OrangeRed, 3000);
+                    }
+
                     BroadcastLobbyRoster();
-                    GameBridge.ShowTopBanner($"Player {playerId} Disconnected", Color.OrangeRed, 3000);
                     LobbyStateChanged?.Invoke();
                     if (_awaitingClientSnapshotAck && AreAllConnectedClientsSnapshotAcked())
                     {
@@ -1437,16 +1916,29 @@ namespace TABCoopMod.Sync
                 }
                 else if (Transport != null && !Transport.IsHost)
                 {
-                    _networkGate.MarkReady(int.MaxValue);
-                    IsInSyncedLevel = false;
                     if (playerId == 1)
                     {
-                        GameBridge.ShowTopBanner("Host disconnected / Room disbanded", Color.OrangeRed, 3500);
-                        StopSession();
+                        _networkGate.MarkReady(int.MaxValue);
+                        IsInSyncedLevel = false;
+                        bool hasRejectReason = !string.IsNullOrEmpty(_pendingJoinRejectReason);
+                        if (!hasRejectReason)
+                            GameBridge.ShowTopBanner("Host disconnected / Room disbanded", Color.OrangeRed, 3500);
+                        StopSession(preserveRejectReason: hasRejectReason);
                     }
                     else
                     {
-                        GameBridge.ShowTopBanner($"Player {playerId} Disconnected", Color.OrangeRed, 3000);
+                        if (IsInSyncedLevel || (GameBridge.CurrentLevelState != null && !GameBridge.IsLevelEnded()))
+                        {
+                            HasDisconnectAlert = true;
+                            DisconnectAlertSlot = deadSlot;
+                            DisconnectAlertPlayerName = deadName;
+                            DisconnectAlertDismissed = false;
+                            GameBridge.ShowTopBanner($"玩家 {deadName} (P{deadSlot}) 已断线（基地保留，等待房主处理）", Color.OrangeRed, 5000);
+                        }
+                        else
+                        {
+                            GameBridge.ShowTopBanner($"Player {deadSlot} Disconnected", Color.OrangeRed, 3000);
+                        }
                         LobbyStateChanged?.Invoke();
                     }
                 }
@@ -1500,6 +1992,71 @@ namespace TABCoopMod.Sync
         /// Host accepts a peer that connected while a level is running. The existing
         /// full-resync path pauses everyone, lets the new client load, then resumes.
         /// </summary>
+        private static void RemoveDisconnectedReservationForPeer(PeerInfo peer)
+        {
+            if (peer == null || DisconnectedMatchPeers.Count == 0) return;
+            DisconnectedMatchPeers.RemoveAll(r =>
+                (peer.SteamId64 != 0 && r.SteamId64 == peer.SteamId64)
+                || r.FactionSlot == peer.EffectiveFactionSlot);
+        }
+
+        private static byte ResolveReconnectingFactionSlot(PeerInfo peer)
+        {
+            var occupied = new HashSet<byte>();
+            foreach (var p in _lobbyRoster)
+            {
+                if (p != null && p.PlayerId != 0 && p.PlayerId != peer.PlayerId)
+                    occupied.Add(p.EffectiveFactionSlot);
+            }
+
+            if (peer.SteamId64 != 0)
+            {
+                var exactSteam = DisconnectedMatchPeers.Find(r => r.SteamId64 == peer.SteamId64 && !occupied.Contains(r.FactionSlot));
+                if (exactSteam != null) return exactSteam.FactionSlot;
+            }
+
+            if (DisconnectedMatchPeers.Count > 0)
+            {
+                string cleanName = (peer.PlayerName ?? string.Empty).Split('#')[0];
+                var nameMatch = DisconnectedMatchPeers.Find(r =>
+                    !occupied.Contains(r.FactionSlot)
+                    && !string.IsNullOrEmpty(r.PlayerName)
+                    && string.Equals(r.PlayerName.Split('#')[0], cleanName, StringComparison.OrdinalIgnoreCase));
+                if (nameMatch != null) return nameMatch.FactionSlot;
+
+                var anyRes = DisconnectedMatchPeers.Find(r => !occupied.Contains(r.FactionSlot));
+                if (anyRes != null) return anyRes.FactionSlot;
+            }
+
+            if (GameMode == CoopGameMode.MultiFaction)
+                return FactionOwnershipTracker.PickReconnectFactionSlot(peer.SteamId64, occupied);
+
+            for (byte s = 2; s <= 3; s++)
+                if (!occupied.Contains(s)) return s;
+            return !occupied.Contains(1) ? (byte)1 : (byte)0;
+        }
+
+        private static void UpsertHostLobbyPeer(PeerInfo peer, bool ready, byte? forcedFactionSlot = null)
+        {
+            if (peer == null) return;
+            _lobbyRoster.RemoveAll(p =>
+                p.PlayerId == peer.PlayerId
+                || (peer.SteamId64 != 0 && p.SteamId64 == peer.SteamId64 && p.PlayerId != 1));
+            byte slot = AllocateFreeFactionSlotForJoiningPeer(peer, forcedFactionSlot);
+            peer.FactionSlot = slot;
+            _lobbyRoster.Add(new PeerInfo
+            {
+                PlayerId = peer.PlayerId,
+                FactionSlot = slot,
+                PlayerName = peer.PlayerName,
+                SteamId64 = peer.SteamId64,
+                IsReady = peer.PlayerId == 1 || ready,
+                IsLocalOrPrivateLan = peer.IsLocalOrPrivateLan
+            });
+            _lobbyRoster.Sort((a, b) => a.PlayerId.CompareTo(b.PlayerId));
+            SyncLocalFactionSlotFromRoster();
+        }
+
         private static bool TryAcceptLateJoin(PeerInfo peer)
         {
             if (peer == null || !IsSessionActive || Transport == null || !Transport.IsHost)
@@ -1512,17 +2069,35 @@ namespace TABCoopMod.Sync
             }
 
             string reason = null;
-            if (GameMode != CoopGameMode.Archon)
-                reason = "独立基地模式暂不支持中途加入";
-            else if (LockstepClock.LoadingLevel || GameBridge.IsGameLoading())
+            byte resolvedSlot = 0;
+            if (LockstepClock.LoadingLevel || GameBridge.IsGameLoading())
                 reason = "房主正在加载，暂不能加入";
             else if (GameBridge.IsLevelEnded())
                 reason = "本局已结束";
             else if (_pendingHostSnapshotExport || _awaitingClientSnapshotAck
-                || _hostSnapshotReloadPending || _lateJoinInProgress)
+                || _hostSnapshotReloadPending || _hostWaitingOwnReload || _lateJoinInProgress)
                 reason = "房主正在同步，请稍后再试";
-            else if (GetEffectivePeers().Count > 3)
-                reason = "房间已满（最多 3 人）";
+            else
+            {
+                int otherClientCount = 0;
+                foreach (var p in GetEffectivePeers())
+                {
+                    if (p != null && p.PlayerId != 1 && p.PlayerId != peer.PlayerId)
+                        otherClientCount++;
+                }
+                if (otherClientCount >= 2)
+                {
+                    reason = "房间已满（最多 3 人）";
+                }
+                else
+                {
+                    resolvedSlot = ResolveReconnectingFactionSlot(peer);
+                    if (resolvedSlot == 0)
+                        reason = GameMode == CoopGameMode.MultiFaction
+                            ? "当前独立基地对局无可用空闲阵营槽位"
+                            : "当前对局无可用空闲位置";
+                }
+            }
 
             if (!string.IsNullOrEmpty(reason))
             {
@@ -1530,15 +2105,13 @@ namespace TABCoopMod.Sync
                 return false;
             }
 
+            peer.FactionSlot = resolvedSlot;
             _lateJoinInProgress = true;
             _lateJoinPeerId = peer.PlayerId;
+            _lateJoinWasAlreadyPaused = LockstepClock.PausedBySession;
+            _lateJoinForcedPause = !_lateJoinWasAlreadyPaused;
 
-            var lobbyPeer = _lobbyRoster.Find(p => p.PlayerId == peer.PlayerId);
-            if (lobbyPeer != null) lobbyPeer.IsReady = true;
-            BroadcastLobbyRoster();
-
-            ModLogger.Info($"[LateJoin] Accepted P{peer.PlayerId}; pausing for full snapshot resync.");
-            GameBridge.ShowTopBanner($"P{peer.PlayerId} 正在加入，正在同步战局...", Color.Cyan, 4000);
+            ModLogger.Info($"[LateJoin] Accepted Transport P{peer.PlayerId} into FactionSlot P{resolvedSlot} (wasAlreadyPaused={_lateJoinWasAlreadyPaused}); pausing for full snapshot resync.");
             LockstepClock.SetSessionPause(true);
             return true;
         }
@@ -1553,8 +2126,10 @@ namespace TABCoopMod.Sync
                     w => w.Write(reason));
             }
             catch { }
-            _lobbyRoster.RemoveAll(p => p.PlayerId == peer.PlayerId);
-            BroadcastLobbyRoster();
+            int removed = _lobbyRoster.RemoveAll(p => p.PlayerId == peer.PlayerId);
+            try { Transport?.DisconnectPeer(peer.PlayerId); } catch { }
+            if (removed > 0)
+                BroadcastLobbyRoster();
             GameBridge.ShowTopBanner(reason, Color.OrangeRed, 3500);
         }
 
@@ -1578,21 +2153,32 @@ namespace TABCoopMod.Sync
             if (!IsSessionActive || !IsInSyncedLevel || Transport == null)
                 return false;
 
-            if (LockstepClock.LoadingLevel || GameBridge.IsGameLoading())
+            if (GameBridge.IsLevelEnded())
             {
-                GameBridge.ShowTopBanner("正在加载，暂时无法手动同步", Color.Orange, 1600);
+                GameBridge.ShowTopBanner("本局已结束，无法手动同步", Color.Orange, 1600);
                 return false;
             }
 
+            if (LockstepClock.LoadingLevel || GameBridge.IsGameLoading()
+                || _pendingHostSnapshotExport || _awaitingClientSnapshotAck
+                || _hostSnapshotReloadPending || _hostWaitingOwnReload
+                || _awaitingSnapshotLoad || _lateJoinInProgress)
+            {
+                GameBridge.ShowTopBanner("同步已在进行中...", Color.Gold, 1600);
+                return false;
+            }
+
+            double now = DXHelper_Environment.Ticks;
+            if (now - _lastManualResyncRequestTicks < ManualResyncCooldownMs && now >= _lastManualResyncRequestTicks)
+            {
+                GameBridge.ShowTopBanner("手动同步冷却中，请稍候", Color.Gold, 1400);
+                return false;
+            }
+            _lastManualResyncRequestTicks = now;
+
             if (Transport.IsHost)
             {
-                if (_pendingHostSnapshotExport || _awaitingClientSnapshotAck)
-                {
-                    GameBridge.ShowTopBanner("同步已在进行中...", Color.Gold, 1600);
-                    return false;
-                }
-
-                _lastAutoResyncTicks = DXHelper_Environment.Ticks;
+                _lastAutoResyncTicks = now;
                 ResetTieredResyncState();
                 ModLogger.WarnImmediate("[CoopSessionManager] Manual resync requested by Host.");
                 GameBridge.ShowTopBanner("手动同步：正在导出并广播快照...", Color.Cyan, 3000);
@@ -1616,18 +2202,55 @@ namespace TABCoopMod.Sync
                 return;
             if (LockstepClock.PausedBySession)
             {
+                _pendingOpenGameMenuAfterPause = false;
+                _pendingOpenGameMenuRequestedAtTicks = -1.0;
+                _allowDirectGameMenuOpenOnce = true;
                 GameBridge.OpenLevelGameMenu();
                 return;
             }
-            if (_pendingOpenGameMenuAfterPause) return;
+
+            double now = DXHelper_Environment.Ticks;
+            if (_pendingOpenGameMenuAfterPause)
+            {
+                if (now - _pendingOpenGameMenuRequestedAtTicks >= 250.0)
+                {
+                    _pendingOpenGameMenuAfterPause = false;
+                    _pendingOpenGameMenuRequestedAtTicks = -1.0;
+                    _allowDirectGameMenuOpenOnce = true;
+                    GameBridge.OpenLevelGameMenu();
+                }
+                return;
+            }
 
             _pendingOpenGameMenuAfterPause = true;
+            _pendingOpenGameMenuRequestedAtTicks = now;
             PauseSyncController.RequestPause(true);
+        }
+
+        internal static bool ConsumeDirectGameMenuBypass()
+        {
+            if (!_allowDirectGameMenuOpenOnce) return false;
+            _allowDirectGameMenuOpenOnce = false;
+            return true;
+        }
+
+        internal static void NotifyCoopGameMenuOpened()
+        {
+            if (!IsSessionActive || !IsInSyncedLevel) return;
+            _coopGameMenuModalOpened = true;
+            if (!DXVision.GUI.DXModalScreen.IsInModal
+                && !LockstepClock.PausedBySession
+                && DXGame.Current != null && DXGame.Current.Paused)
+            {
+                _coopGameMenuModalOpened = false;
+                DXGame.Current.Paused = false;
+            }
         }
 
         public static void CancelPendingGameMenuOpen()
         {
             _pendingOpenGameMenuAfterPause = false;
+            _pendingOpenGameMenuRequestedAtTicks = -1.0;
         }
 
         /// <summary>
@@ -1682,11 +2305,18 @@ namespace TABCoopMod.Sync
                 {
                     if (!FactionOwnershipTracker.IsInitialized)
                     {
-                        int pCount = Math.Max(1, GetEffectivePeers().Count);
-                        FactionOwnershipTracker.EnsureExtraCommandCentersInLiveLevel(pCount);
-                        FactionOwnershipTracker.AssignInitialOwnershipFromLevel(pCount);
+                        byte[] slots = GetOccupiedFactionSlotsSorted();
+                        FactionOwnershipTracker.EnsureExtraCommandCentersInLiveLevel(slots.Length, slots);
+                        FactionOwnershipTracker.AssignInitialOwnershipFromLevel(slots.Length, slots);
                     }
                     FactionOwnershipTracker.SaveToLevelScriptVariables();
+                }
+
+                string curSaveName = GameBridge.CurrentGameStateName;
+                if (!string.IsNullOrWhiteSpace(curSaveName)
+                    && !string.Equals(curSaveName, "coop_host_snapshot", StringComparison.OrdinalIgnoreCase))
+                {
+                    HostOriginalSaveName = curSaveName;
                 }
 
                 ModLogger.Info($"[CoopSessionManager] Exporting Host snapshot to {savPath}...");
@@ -1769,6 +2399,17 @@ namespace TABCoopMod.Sync
             catch (Exception ex)
             {
                 ModLogger.Error("[CoopSessionManager] Failed to broadcast level snapshot", ex);
+                _hostSnapshotReloadPending = false;
+                _hostWaitingOwnReload = false;
+                _awaitingClientSnapshotAck = false;
+                _awaitingClientAckStartTicks = -1.0;
+                _lateJoinInProgress = false;
+                _lateJoinPeerId = 0;
+                if (_lateJoinForcedPause)
+                {
+                    _lateJoinForcedPause = false;
+                    LockstepClock.SetSessionPause(false);
+                }
             }
             finally
             {
@@ -1783,10 +2424,24 @@ namespace TABCoopMod.Sync
             }
         }
 
+        private static void ClearActiveSnapshotCache()
+        {
+            _activeSnapshotSavBytes = null;
+            _activeSnapshotTotalChunks = 0;
+            _activeSnapshotCheckContent = string.Empty;
+            _activeSnapshotSeed = 0;
+            _activeSnapshotIdCounter = 0;
+        }
+
         private static void BroadcastSnapshotChunksToClients(byte[] savBytes, string chkText, int syncSeed, long idCounter)
         {
             if (savBytes == null || Transport == null || !Transport.IsHost) return;
             int totalChunks = (savBytes.Length + ChunkSizeBytes - 1) / ChunkSizeBytes;
+            _activeSnapshotSavBytes = savBytes;
+            _activeSnapshotTotalChunks = totalChunks;
+            _activeSnapshotCheckContent = chkText ?? string.Empty;
+            _activeSnapshotSeed = syncSeed;
+            _activeSnapshotIdCounter = idCounter;
             _clientSnapshotAckReceived = false;
             _clientSnapshotAckPeers.Clear();
             _awaitingClientSnapshotAck = true;
@@ -1837,20 +2492,26 @@ namespace TABCoopMod.Sync
             _awaitingClientAckStartTicks = -1.0;
             _clientSnapshotAckReceived = false;
             _clientSnapshotAckPeers.Clear();
+            ClearActiveSnapshotCache();
 
             ResetSyncTrackingState();
 
             bool lateJoinCompleted = _lateJoinInProgress;
             byte lateJoinPeerId = _lateJoinPeerId;
+            bool startPaused = lateJoinCompleted && _lateJoinWasAlreadyPaused;
             _lateJoinInProgress = false;
             _lateJoinPeerId = 0;
+            _lateJoinForcedPause = false;
+            _lateJoinWasAlreadyPaused = false;
 
-            EnterSyncedLevel();
+            EnterSyncedLevel(startPaused);
 
             if (lateJoinCompleted)
             {
-                ModLogger.Info($"[LateJoin] P{lateJoinPeerId} completed snapshot load; resuming session.");
-                GameBridge.ShowTopBanner($"P{lateJoinPeerId} 已加入战局", Color.SpringGreen, 3000);
+                EnsureDisconnectAlertUpdated(broadcastToClients: true);
+                byte joinedSlot = GetFactionSlotForTransportId(lateJoinPeerId);
+                ModLogger.Info($"[LateJoin] P{joinedSlot} (Transport P{lateJoinPeerId}) completed snapshot load; paused={startPaused}.");
+                GameBridge.ShowTopBanner($"P{joinedSlot} 已重连回到战局" + (startPaused ? "（保持暂停中）" : ""), Color.SpringGreen, 3000);
             }
 
             int startTick = DXGame.Current?.IAIterationInt ?? 0;
@@ -1858,7 +2519,8 @@ namespace TABCoopMod.Sync
             _useCompactWireProtocol = true;
             SyncedAdaptivePhysicsIterations = TestHarnessConfig.AdaptivePhysicsIterations;
             byte protoFlags = (byte)(SessionStartProtoFlag_CompactBinary
-                | (SyncedAdaptivePhysicsIterations ? SessionStartProtoFlag_AdaptivePhysIter : 0));
+                | (SyncedAdaptivePhysicsIterations ? SessionStartProtoFlag_AdaptivePhysIter : 0)
+                | (startPaused ? SessionStartProtoFlag_StartPaused : 0));
             Transport.Broadcast(SendChannel.ReliableCommand, PacketType.SessionStart, w =>
             {
                 w.Write(startTick);
@@ -1875,8 +2537,9 @@ namespace TABCoopMod.Sync
             ResetSyncTrackingState();
             _useCompactWireProtocol = (protoFlags & SessionStartProtoFlag_CompactBinary) != 0;
             SyncedAdaptivePhysicsIterations = (protoFlags & SessionStartProtoFlag_AdaptivePhysIter) != 0;
+            bool startPaused = (protoFlags & SessionStartProtoFlag_StartPaused) != 0;
             InputDelayTicks = Math.Max(MinInputDelayTicks, Math.Min(MaxInputDelayTicks, (int)hostDelay));
-            EnterSyncedLevel();
+            EnterSyncedLevel(startPaused);
             ModLogger.InfoImmediate($"[CoopSessionManager] Received SessionStart from Host (tick={startTick}, localTick={DXGame.Current?.IAIterationInt ?? 0}, seed={seed}, idCounter={idCounter}, inputDelay={InputDelayTicks}, compact={_useCompactWireProtocol}, mode={EffectiveResyncMode}). Unpausing in lockstep!");
         }
 
@@ -1963,9 +2626,12 @@ namespace TABCoopMod.Sync
         /// Call once both peers are inside the same synced level. Installs the turn-input gate and
         /// lets the simulation run the first InputDelayTicks immediately while broadcasts catch up.
         /// </summary>
-        public static void EnterSyncedLevel()
+        public static void EnterSyncedLevel(bool startPaused = false)
         {
             if (!IsSessionActive) return;
+
+            UI.CoopLobbyWindow.ClearStaleWindowOnLevelEnter();
+            SyncLocalFactionSlotFromRoster();
 
             _pendingTurnCommands.Clear();
             _hostSymmetricQueue.Clear();
@@ -1998,11 +2664,11 @@ namespace TABCoopMod.Sync
 
             // The save loader leaves DXGame.Paused/GameSpeed at 0; clear it so engine animations and
             // the fixed-step clock start running. Session pauses are tracked separately.
-            LockstepClock.SetSessionPause(false);
+            LockstepClock.SetSessionPause(startPaused);
             LockstepClock.ResetHostTickPacing();
             if (DXGame.Current != null)
             {
-                if (DXGame.Current.Paused) DXGame.Current.Paused = false;
+                DXGame.Current.Paused = startPaused;
                 if (DXGame.Current.GameSpeed <= 0.0) DXGame.Current.GameSpeed = 1.0;
                 if (!DXGame.Current.InputEnabled)
                 {
@@ -2067,7 +2733,7 @@ namespace TABCoopMod.Sync
 
                 foreach (var cmd in due)
                 {
-                    if (cmd != null && cmd.TraceId != 0 && Transport != null && cmd.PlayerId == Transport.LocalPlayerId)
+                    if (cmd != null && cmd.TraceId != 0 && Transport != null && cmd.PlayerId == CommandInterceptor.LocalPlayerId)
                     {
                         long sentTs = 0;
                         bool found = false;
@@ -2175,8 +2841,9 @@ namespace TABCoopMod.Sync
             var game = DXGame.Current;
             if (game == null) return null;
 
-            byte localPid = Transport.LocalPlayerId;
-            if (localPid <= 1) return null;
+            if (Transport == null || Transport.IsHost) return null;
+            byte localPid = CommandInterceptor.LocalPlayerId;
+            if (localPid < 1 || localPid > 3) return null;
 
             Dictionary<ulong, UnitOwnershipEntry> ownedSnapshot = null;
             List<ulong> expired = null;
@@ -2307,7 +2974,7 @@ namespace TABCoopMod.Sync
             if (Transport == null || !Transport.IsHost || !IsSessionActive || !IsInSyncedLevel
                 || LockstepClock.LoadingLevel || GameBridge.IsGameLoading()
                 || LockstepClock.PausedBySession
-                || (DXGame.Current != null && DXGame.Current.Paused)
+                || (DXGame.Current != null && (DXGame.Current.Paused || DXGame.Current.GameSpeed <= 0.1))
                 || GameBridge.IsLevelEnded()
                 || DXVision.GUI.DXModalScreen.IsInModal)
             {
@@ -2334,9 +3001,12 @@ namespace TABCoopMod.Sync
             string text;
             if (TryGetSlowestClientLagTicks(out byte slowPid, out int lagTicks, out double sampleAgeMs, includeStale: true))
             {
+                int backpressureLagThreshold = DeterministicSandboxPatches.DiagAvgTickLogicMs > 30.0
+                    ? 4
+                    : HostBackpressureSlowLagTicks;
                 if (sampleAgeMs >= 1200.0)
                     text = $"等待 P{slowPid} 响应（{sampleAgeMs / 1000.0:F1}s 无上报）";
-                else if (lagTicks > 0)
+                else if (lagTicks >= backpressureLagThreshold)
                     text = $"等待 P{slowPid} 输入（落后 {lagTicks}t）";
                 else
                     text = "本机处理中...";
@@ -2377,7 +3047,18 @@ namespace TABCoopMod.Sync
                 if (DXGame.Current != null) DXGame.Current.InputEnabled = false;
                 if (_hostSnapshotReloadPending && _hostWaitingOwnReload)
                 {
+                    SyncLocalFactionSlotFromRoster();
                     FactionOwnershipTracker.TryLoadFromLevelScriptVariables();
+                    if (FactionOwnershipTracker.IsInitialized)
+                    {
+                        FactionOwnershipTracker.EnsureUnownedPlayerEntitiesAssigned();
+                        FactionContextManager.EnsureInitializedAfterRestore();
+                    }
+                    if (!string.IsNullOrWhiteSpace(HostOriginalSaveName)
+                        && string.Equals(GameBridge.CurrentGameStateName, "coop_host_snapshot", StringComparison.OrdinalIgnoreCase))
+                    {
+                        GameBridge.CurrentGameStateName = HostOriginalSaveName;
+                    }
                     RestoreLocalControlGroupsAfterMidGameReload();
                     _hostWaitingOwnReload = false;
                     ModLogger.InfoImmediate($"[CoopSessionManager] Host symmetric snapshot reload finished at tick={DXGame.Current?.IAIterationInt ?? 0} (clientAck={_clientSnapshotAckReceived}).");
@@ -2399,6 +3080,27 @@ namespace TABCoopMod.Sync
                 }
                 if (!IsInSyncedLevel && !_hostSnapshotReloadPending)
                 {
+                    SyncLocalFactionSlotFromRoster();
+                    string loadedSaveName = GameBridge.CurrentGameStateName;
+                    if (!string.IsNullOrWhiteSpace(loadedSaveName)
+                        && !string.Equals(loadedSaveName, "coop_host_snapshot", StringComparison.OrdinalIgnoreCase))
+                    {
+                        HostOriginalSaveName = loadedSaveName;
+                    }
+
+                    // Reset any stale static Multi-Faction state before probing the newly loaded/generated level.
+                    FactionOwnershipTracker.Reset();
+                    FactionContextManager.Reset();
+                    WonderCrowdfundManager.Reset();
+
+                    bool restoredMultiFaction = FactionOwnershipTracker.TryLoadFromLevelScriptVariables();
+                    if (restoredMultiFaction)
+                    {
+                        FactionOwnershipTracker.EnsureUnownedPlayerEntitiesAssigned();
+                        FactionContextManager.EnsureInitializedAfterRestore();
+                        BroadcastLobbyRoster();
+                    }
+
                     SetHostRoomPhase(LobbyRoomPhase.HostLoadingLevel, "正在同步关卡...");
                     RequestSnapshotBroadcast();
                 }
@@ -2408,7 +3110,13 @@ namespace TABCoopMod.Sync
             if (!_awaitingSnapshotLoad) return;
 
             _awaitingSnapshotLoad = false;
+            SyncLocalFactionSlotFromRoster();
             FactionOwnershipTracker.TryLoadFromLevelScriptVariables();
+            if (FactionOwnershipTracker.IsInitialized)
+            {
+                FactionOwnershipTracker.EnsureUnownedPlayerEntitiesAssigned();
+                FactionContextManager.EnsureInitializedAfterRestore();
+            }
             RestoreLocalControlGroupsAfterMidGameReload();
             IsInSyncedLevel = false;
             LockstepClock.SetSessionPause(true);
@@ -2465,21 +3173,36 @@ namespace TABCoopMod.Sync
             }
         }
 
+        private static bool FlushPendingJoinRejectNotice()
+        {
+            if (string.IsNullOrEmpty(_pendingJoinRejectReason)) return false;
+            string rejectReason = _pendingJoinRejectReason;
+            _pendingJoinRejectReason = null;
+            ModLogger.Warn($"[CoopSessionManager] Join rejected by Host: {rejectReason}");
+            StopSession(preserveRejectReason: false);
+            if (GameBridge.CurrentLevelState == null)
+            {
+                UI.CoopLobbyWindow.NotifyEntryError(rejectReason);
+                if (!TestHarnessConfig.Enabled && !TestHarnessConfig.ControlEnabled && !GameBridge.IsGameLoading())
+                {
+                    try { GameBridge.ShowAlertMessageBox("加入房间被拒绝", rejectReason); } catch { }
+                }
+            }
+            else
+            {
+                GameBridge.ShowTopBanner(rejectReason, Color.OrangeRed, 5000);
+            }
+            return true;
+        }
+
         public static void OnFrameTick()
         {
             var frameGame = DXGame.Current;
             if (frameGame == null || frameGame.Disposing)
                 return;
 
-            if (!string.IsNullOrEmpty(_pendingJoinRejectReason))
-            {
-                string rejectReason = _pendingJoinRejectReason;
-                _pendingJoinRejectReason = null;
-                ModLogger.Warn($"[CoopSessionManager] Join rejected by Host: {rejectReason}");
-                GameBridge.ShowTopBanner(rejectReason, Color.OrangeRed, 5000);
-                StopSession();
+            if (FlushPendingJoinRejectNotice())
                 return;
-            }
 
             if (!TestHarnessConfig.Enabled && !TestHarnessConfig.ControlEnabled)
             {
@@ -2506,6 +3229,7 @@ namespace TABCoopMod.Sync
             CoopLobbyWindow.Tick();
             UI.MultiFactionPanel.Tick();
             UI.ManualSyncButton.Tick();
+            UI.DisconnectNoticeOverlay.Tick();
             UI.AllyOverlayRenderer.UpdateUnitFactionRings();
             UI.PerfOverlayRenderer.Tick();
 
@@ -2563,10 +3287,13 @@ namespace TABCoopMod.Sync
             }
 
             Transport?.PollEvents();
+            if (FlushPendingJoinRejectNotice())
+                return;
             ProbeNetworkRtt();
 
             // Keep the engine's loader fades advancing while the Client waits to enter the level.
             TickLoadingFade();
+            PumpClientSnapshotMissingCheck();
 
             if (!IsSessionActive || Transport == null || DXGame.Current == null || DXGame.Current.Disposing)
                 return;
@@ -2586,6 +3313,7 @@ namespace TABCoopMod.Sync
                     _clientSnapshotAckPeers.Clear();
                     _lateJoinInProgress = false;
                     _lateJoinPeerId = 0;
+                    ClearActiveSnapshotCache();
                     EnterSyncedLevel();
                 }
                 else
@@ -2662,14 +3390,37 @@ namespace TABCoopMod.Sync
 
             // Deferred game-menu open: the menu request first applies a synchronized pause, then
             // opens the native menu on a later frame so the client never freezes alone.
+            // Fallback after GameMenuPauseWaitTimeoutMs so Client is never locked out of ESC if Host stalls.
             if (_pendingOpenGameMenuAfterPause
-                && LockstepClock.PausedBySession
                 && !LockstepClock.LoadingLevel
                 && !GameBridge.IsGameLoading()
                 && !DXVision.GUI.DXModalScreen.IsInModal)
             {
-                _pendingOpenGameMenuAfterPause = false;
-                GameBridge.OpenLevelGameMenu();
+                double nowMenuWait = DXHelper_Environment.Ticks;
+                bool pauseSettled = LockstepClock.PausedBySession;
+                bool timedOut = _pendingOpenGameMenuRequestedAtTicks > 0.0
+                    && (nowMenuWait - _pendingOpenGameMenuRequestedAtTicks) >= GameMenuPauseWaitTimeoutMs;
+                if (pauseSettled || timedOut)
+                {
+                    _pendingOpenGameMenuAfterPause = false;
+                    _pendingOpenGameMenuRequestedAtTicks = -1.0;
+                    _allowDirectGameMenuOpenOnce = true;
+                    if (timedOut && !pauseSettled)
+                        ModLogger.Warn("[CoopSessionManager] Pause sync timed out before opening game menu; falling back to local open.");
+                    GameBridge.OpenLevelGameMenu();
+                }
+            }
+
+            // Reconcile native game-menu Paused capture: if a peer unpaused the match while our
+            // menu was open, native menu close restores Paused=true even though PausedBySession=false.
+            if (_coopGameMenuModalOpened && !DXVision.GUI.DXModalScreen.IsInModal)
+            {
+                _coopGameMenuModalOpened = false;
+                if (!LockstepClock.PausedBySession && DXGame.Current != null && DXGame.Current.Paused)
+                {
+                    DXGame.Current.Paused = false;
+                    ModLogger.Info("[CoopSessionManager] Cleared stale native game-menu pause after peer resume.");
+                }
             }
 
             // 3. Broadcast Ally Cursor & Camera Viewport at 20Hz when moving, 4Hz heartbeat when idle
@@ -2698,7 +3449,7 @@ namespace TABCoopMod.Sync
                     {
                         Transport.Broadcast(SendChannel.UnreliableSequenced, PacketType.AllyCursorAndCamera, w =>
                         {
-                            w.Write((byte)(Transport.LocalPlayerId | 0x80));
+                            w.Write((byte)(CommandInterceptor.LocalPlayerId | 0x80));
                             w.Write(QuantizeCursorCoord(mouseWorldPos.X));
                             w.Write(QuantizeCursorCoord(mouseWorldPos.Y));
                             w.Write(QuantizeCursorCoord(camArea.X));
@@ -2712,7 +3463,7 @@ namespace TABCoopMod.Sync
                     {
                         Transport.Broadcast(SendChannel.UnreliableSequenced, PacketType.AllyCursorAndCamera, w =>
                         {
-                            w.Write(Transport.LocalPlayerId);
+                            w.Write(CommandInterceptor.LocalPlayerId);
                             w.Write(mouseWorldPos.X);
                             w.Write(mouseWorldPos.Y);
                             w.Write(camArea.X);
@@ -3512,7 +4263,7 @@ namespace TABCoopMod.Sync
         /// </summary>
         public static void SendTacticalPing(Point cell, string label = null)
         {
-            byte pid = Transport != null ? Transport.LocalPlayerId : CommandInterceptor.LocalPlayerId;
+            byte pid = CommandInterceptor.LocalPlayerId;
             string effectiveLabel = string.IsNullOrEmpty(label) ? $"Player {pid}" : label;
 
             AllyOverlayRenderer.TriggerMinimapAndGroundPing(pid, cell, effectiveLabel);
@@ -3541,9 +4292,11 @@ namespace TABCoopMod.Sync
                     _lobbyRoster.Clear();
                     for (int i = 0; i < count; i++)
                     {
+                        byte pid = r.ReadByte();
                         _lobbyRoster.Add(new PeerInfo
                         {
-                            PlayerId = r.ReadByte(),
+                            PlayerId = pid,
+                            FactionSlot = pid,
                             PlayerName = r.ReadString(),
                             SteamId64 = r.ReadUInt64(),
                             IsReady = r.ReadBoolean()
@@ -3586,8 +4339,44 @@ namespace TABCoopMod.Sync
                     {
                         SpawnMode = (MultiFactionSpawnMode)r.ReadByte();
                     }
+                    if (r.BaseStream.Position < r.BaseStream.Length)
+                    {
+                        byte slotCount = r.ReadByte();
+                        for (int i = 0; i < slotCount && r.BaseStream.Position < r.BaseStream.Length; i++)
+                        {
+                            byte slot = r.ReadByte();
+                            if (i < _lobbyRoster.Count && slot >= 1 && slot <= 3)
+                                _lobbyRoster[i].FactionSlot = slot;
+                        }
+                    }
                     Transport.SyncPeers(_lobbyRoster);
+                    SyncLocalFactionSlotFromRoster();
                     LobbyStateChanged?.Invoke();
+                    break;
+                }
+
+                case PacketType.LobbySeatSwapRequest:
+                {
+                    if (!Transport.IsHost) break;
+                    byte targetSlot = r.ReadByte();
+                    ApplyHostSeatSwap(senderId, targetSlot);
+                    break;
+                }
+
+                case PacketType.PeerDisconnectNotice:
+                {
+                    if (Transport.IsHost) break;
+                    bool active = r.ReadBoolean();
+                    byte dSlot = r.ReadByte();
+                    string dName = r.ReadString();
+                    HasDisconnectAlert = active;
+                    DisconnectAlertSlot = dSlot;
+                    DisconnectAlertPlayerName = dName ?? string.Empty;
+                    DisconnectAlertDismissed = false;
+                    if (active)
+                        GameBridge.ShowTopBanner($"玩家 {dName} (P{dSlot}) 已断线（基地保留），等待房主暂停重连或保存退出", Color.OrangeRed, 5000);
+                    else
+                        UI.DisconnectNoticeOverlay.Reset();
                     break;
                 }
 
@@ -3643,11 +4432,17 @@ namespace TABCoopMod.Sync
 
                 case PacketType.SnapshotBegin:
                 {
+                    if (_expectedChunks > 0)
+                    {
+                        _incomingChunks.Clear();
+                    }
                     _expectedSaveBytes = r.ReadInt32();
                     _expectedChunks = r.ReadInt32();
                     _incomingCheckContent = r.ReadString();
                     _incomingRandomSeed = r.ReadInt32();
                     _incomingEntityIdCounter = r.ReadInt64();
+                    _lastSnapshotRxTicks = DXHelper_Environment.Ticks;
+                    _lastSnapshotChunkRequestTicks = _lastSnapshotRxTicks;
                     ModLogger.Info($"[CoopSessionManager] Receiving Snapshot from Host ({_expectedSaveBytes:N0} bytes, {_expectedChunks} chunks, seed={_incomingRandomSeed}, idCounter={_incomingEntityIdCounter}); buffered={_incomingChunks.Count}.");
                     GameBridge.ShowTopBanner("Receiving Map Snapshot from Host...", Color.Cyan, 3000);
                     TryAssembleSnapshot();
@@ -3661,9 +4456,59 @@ namespace TABCoopMod.Sync
                     byte[] data = r.ReadBytes(len);
                     // Chunks may arrive before SnapshotBegin and out of order (ChaosTransport jitter
                     // reorders even ReliableOrdered). Buffer by index; assemble once complete.
-                    if (chunkIdx >= 0) _incomingChunks[chunkIdx] = data;
+                    if (chunkIdx >= 0)
+                    {
+                        _incomingChunks[chunkIdx] = data;
+                        _lastSnapshotRxTicks = DXHelper_Environment.Ticks;
+                    }
                     ModLogger.Info($"[CoopSessionManager] Snapshot chunk {chunkIdx} received ({len:N0} bytes, buffered={_incomingChunks.Count}/{_expectedChunks}).");
                     TryAssembleSnapshot();
+                    break;
+                }
+
+                case PacketType.SnapshotChunkRequest:
+                {
+                    if (!Transport.IsHost || _activeSnapshotSavBytes == null || _activeSnapshotTotalChunks <= 0) break;
+                    bool needBegin = r.ReadBoolean();
+                    ushort reqCount = r.ReadUInt16();
+                    var requested = new List<int>(Math.Min((int)reqCount, 64));
+                    for (int i = 0; i < reqCount && r.BaseStream.Position + 4 <= r.BaseStream.Length; i++)
+                    {
+                        int idx = r.ReadInt32();
+                        if (idx >= 0 && idx < _activeSnapshotTotalChunks && requested.Count < 64)
+                            requested.Add(idx);
+                    }
+                    if (needBegin)
+                    {
+                        byte[] savCopy = _activeSnapshotSavBytes;
+                        int total = _activeSnapshotTotalChunks;
+                        string chk = _activeSnapshotCheckContent ?? string.Empty;
+                        int seed = _activeSnapshotSeed;
+                        long idc = _activeSnapshotIdCounter;
+                        Transport.SendToPeer(senderId, SendChannel.ReliableOrdered, PacketType.SnapshotBegin, w =>
+                        {
+                            w.Write(savCopy.Length);
+                            w.Write(total);
+                            w.Write(chk);
+                            w.Write(seed);
+                            w.Write(idc);
+                        });
+                    }
+                    for (int i = 0; i < requested.Count; i++)
+                    {
+                        int idx = requested[i];
+                        int off = idx * ChunkSizeBytes;
+                        int len = Math.Min(ChunkSizeBytes, _activeSnapshotSavBytes.Length - off);
+                        if (len <= 0) continue;
+                        byte[] savRef = _activeSnapshotSavBytes;
+                        Transport.SendToPeer(senderId, SendChannel.ReliableOrdered, PacketType.SnapshotChunk, w =>
+                        {
+                            w.Write(idx);
+                            w.Write(len);
+                            w.Write(savRef, off, len);
+                        });
+                    }
+                    ModLogger.Info($"[CoopSessionManager] Retransmitted {requested.Count} missing snapshot chunk(s) to Client({senderId}) (needBegin={needBegin}).");
                     break;
                 }
 
@@ -3715,7 +4560,7 @@ namespace TABCoopMod.Sync
                         for (int i = 0; i < count; i++)
                         {
                             var cmd = NetCommand.ReadFrom(r);
-                            cmd.PlayerId = senderId;
+                            cmd.PlayerId = GetFactionSlotForTransportId(senderId);
                             int safeTick = Math.Max(cmd.TargetSimTick, minSafeTick);
                             cmd.TargetSimTick = safeTick;
                             if (!_hostSymmetricQueue.TryGetValue(safeTick, out var bucket))
@@ -3740,7 +4585,7 @@ namespace TABCoopMod.Sync
                         for (int i = 0; i < count; i++)
                         {
                             var cmd = NetCommand.ReadFrom(r);
-                            cmd.PlayerId = senderId;
+                            cmd.PlayerId = GetFactionSlotForTransportId(senderId);
                             _hostTurnBuffer.Add(cmd);
                         }
                     }
@@ -3861,15 +4706,29 @@ namespace TABCoopMod.Sync
 
                 case PacketType.ManualResyncRequest:
                 {
-                    if (!Transport.IsHost) break;
+                    if (!Transport.IsHost || !IsInSyncedLevel) break;
+                    if (GameBridge.IsLevelEnded())
+                    {
+                        GameBridge.ShowTopBanner("本局已结束，无法手动同步", Color.Orange, 1600);
+                        break;
+                    }
                     if (LockstepClock.LoadingLevel || GameBridge.IsGameLoading()
-                        || _pendingHostSnapshotExport || _awaitingClientSnapshotAck)
+                        || _pendingHostSnapshotExport || _awaitingClientSnapshotAck
+                        || _hostSnapshotReloadPending || _hostWaitingOwnReload
+                        || _awaitingSnapshotLoad || _lateJoinInProgress)
                     {
                         GameBridge.ShowTopBanner("同步已在进行中...", Color.Gold, 1600);
                         break;
                     }
 
-                    _lastAutoResyncTicks = DXHelper_Environment.Ticks;
+                    double nowReq = DXHelper_Environment.Ticks;
+                    if (nowReq - _lastManualResyncRequestTicks < ManualResyncCooldownMs && nowReq >= _lastManualResyncRequestTicks)
+                    {
+                        GameBridge.ShowTopBanner("手动同步冷却中，请稍候", Color.Gold, 1400);
+                        break;
+                    }
+                    _lastManualResyncRequestTicks = nowReq;
+                    _lastAutoResyncTicks = nowReq;
                     ResetTieredResyncState();
                     ModLogger.WarnImmediate($"[CoopSessionManager] Manual resync requested by Client P{senderId}.");
                     GameBridge.ShowTopBanner($"P{senderId} 请求手动同步，正在导出快照...", Color.Cyan, 3000);
@@ -3888,23 +4747,6 @@ namespace TABCoopMod.Sync
                 {
                     if (!Transport.IsHost) break;
                     int pTick = r.ReadInt32();
-                    lock (_driftBaselineLock)
-                    {
-                        int ackSeq = 0;
-                        foreach (var kvp in _hostPendingBaselinesBySeq)
-                        {
-                            if (kvp.Value.PeerId == senderId && kvp.Value.Tick == pTick && kvp.Value.Seq > ackSeq)
-                                ackSeq = kvp.Value.Seq;
-                        }
-                        if (ackSeq > 0 && _hostPendingBaselinesBySeq.TryGetValue(ackSeq, out var confirmed))
-                        {
-                            _hostAckedBaselineByPeer[senderId] = (confirmed.Seq, confirmed.Samples);
-                            var rm = new List<int>();
-                            foreach (var k in _hostPendingBaselinesBySeq.Keys)
-                                if (_hostPendingBaselinesBySeq[k].PeerId == senderId && k <= ackSeq) rm.Add(k);
-                            for (int ri = 0; ri < rm.Count; ri++) _hostPendingBaselinesBySeq.Remove(rm[ri]);
-                        }
-                    }
                     bool wasApplied = r.ReadBoolean();
                     int appliedCount = r.ReadInt32();
                     int comparedCount = r.ReadInt32();
@@ -3921,6 +4763,93 @@ namespace TABCoopMod.Sync
                     int killsApplied = r.ReadInt32();
                     int missingOnHost = r.ReadInt32();
                     int missingOnClient = r.ReadInt32();
+                    bool hasExplicitAck = r.BaseStream.Position + 4 <= r.BaseStream.Length;
+                    int explicitAckSeq = hasExplicitAck ? r.ReadInt32() : 0;
+
+                    lock (_driftBaselineLock)
+                    {
+                        if (hasExplicitAck && explicitAckSeq < 0)
+                        {
+                            _hostAckedBaselineByPeer.Remove(senderId);
+                            var rmAll = new List<int>();
+                            foreach (var k in _hostPendingBaselinesBySeq.Keys)
+                                if (_hostPendingBaselinesBySeq[k].PeerId == senderId) rmAll.Add(k);
+                            for (int ri = 0; ri < rmAll.Count; ri++) _hostPendingBaselinesBySeq.Remove(rmAll[ri]);
+                        }
+                        else
+                        {
+                            int ackSeq = 0;
+                            if (hasExplicitAck && explicitAckSeq > 0)
+                            {
+                                if (_hostPendingBaselinesBySeq.TryGetValue(explicitAckSeq, out var exact) && exact.PeerId == senderId)
+                                    ackSeq = explicitAckSeq;
+                            }
+                            else
+                            {
+                                foreach (var kvp in _hostPendingBaselinesBySeq)
+                                {
+                                    if (kvp.Value.PeerId == senderId && kvp.Value.Tick == pTick && kvp.Value.Seq > ackSeq)
+                                        ackSeq = kvp.Value.Seq;
+                                }
+                            }
+                            if (ackSeq > 0 && _hostPendingBaselinesBySeq.TryGetValue(ackSeq, out var confirmed))
+                            {
+                                _hostAckedBaselineByPeer[senderId] = (confirmed.Seq, confirmed.Samples);
+                                var rm = new List<int>();
+                                foreach (var k in _hostPendingBaselinesBySeq.Keys)
+                                    if (_hostPendingBaselinesBySeq[k].PeerId == senderId && k <= ackSeq) rm.Add(k);
+                                for (int ri = 0; ri < rm.Count; ri++) _hostPendingBaselinesBySeq.Remove(rm[ri]);
+                            }
+                        }
+                    }
+
+                    // Baseline-only ACK/NACK reports (from cache-miss or corrupt-baseline skip) must not mutate streak counters.
+                    if (hasExplicitAck && comparedCount == 0 && lifeDiffCount == 0 && missingOnClient == 0 && missingOnHost == 0 && !exceededThreshold)
+                        break;
+
+                    List<ulong> favorKillIds = null;
+                    List<ZombieFavorKeepFarFix> favorKeepFar = null;
+                    if (r.BaseStream.Position + 2 <= r.BaseStream.Length)
+                    {
+                        ushort fkCount = r.ReadUInt16();
+                        if (fkCount > 0)
+                        {
+                            int take = Math.Min((int)fkCount, 64);
+                            favorKillIds = new List<ulong>(Math.Min(take, 32));
+                            for (int fi = 0; fi < fkCount && r.BaseStream.Position + 8 <= r.BaseStream.Length; fi++)
+                            {
+                                ulong fid = r.ReadUInt64();
+                                if (fi < 32) favorKillIds.Add(fid);
+                            }
+                        }
+                        if (r.BaseStream.Position + 2 <= r.BaseStream.Length)
+                        {
+                            ushort fpCount = r.ReadUInt16();
+                            if (fpCount > 0)
+                            {
+                                favorKeepFar = new List<ZombieFavorKeepFarFix>(Math.Min((int)fpCount, 64));
+                                for (int fi = 0; fi < fpCount && r.BaseStream.Position + 16 <= r.BaseStream.Length; fi++)
+                                {
+                                    ulong pid = r.ReadUInt64();
+                                    float px = r.ReadSingle();
+                                    float py = r.ReadSingle();
+                                    if (fi < 64)
+                                        favorKeepFar.Add(new ZombieFavorKeepFarFix { Id = pid, X = px, Y = py });
+                                }
+                            }
+                        }
+                    }
+                    if ((favorKillIds != null && favorKillIds.Count > 0) || (favorKeepFar != null && favorKeepFar.Count > 0))
+                    {
+                        _incomingZombieFavorAlignQueue.Enqueue(new PendingZombieFavorAlign
+                        {
+                            Generation = _asyncGeneration,
+                            Tick = pTick,
+                            SenderPlayerId = senderId,
+                            KillZombieIds = favorKillIds,
+                            KeepFarFixes = favorKeepFar
+                        });
+                    }
 
                     var peerState = GetOrCreatePeerDesyncState(senderId);
 
@@ -3988,7 +4917,7 @@ namespace TABCoopMod.Sync
                     byte hdr = r.ReadByte();
                     bool isCompact = (hdr & 0x80) != 0;
                     byte pid = (byte)(hdr & 0x7F);
-                    if (pid == Transport.LocalPlayerId) break;
+                    if (pid == CommandInterceptor.LocalPlayerId) break;
 
                     PointF mouseWorld;
                     RectangleF camWorld;
@@ -4067,7 +4996,7 @@ namespace TABCoopMod.Sync
                     int cellX = r.ReadInt32();
                     int cellY = r.ReadInt32();
                     string label = r.ReadString();
-                    if (Transport != null && pid == Transport.LocalPlayerId) break;
+                    if (Transport != null && pid == CommandInterceptor.LocalPlayerId) break;
 
                     AllyOverlayRenderer.TriggerMinimapAndGroundPing(pid, new Point(cellX, cellY), label);
 
@@ -4205,10 +5134,11 @@ namespace TABCoopMod.Sync
             if (isMulti)
             {
                 FactionContextManager.FlushActiveOwnerFromLevelState();
-                int maxP = Math.Max(1, Math.Min(3, (int)FactionOwnershipTracker.ActivePlayerCount));
+                const int maxP = 3;
                 var list = new List<FactionEconEntry>(maxP);
                 for (byte p = 1; p <= maxP; p++)
                 {
+                    if (!FactionOwnershipTracker.IsSlotParticipating(p)) continue;
                     var ledger = FactionContextManager.GetLedger(p);
                     if (ledger == null) continue;
                     var le = ledger.Economy;
@@ -4928,6 +5858,35 @@ namespace TABCoopMod.Sync
             {
                 if (item.Generation != curGen || Transport == null) continue;
 
+                if (item.SkipApplyBaselineOnly)
+                {
+                    if (item.BaselineAckSeq != 0 && Transport.IsActive)
+                    {
+                        Transport.SendToPeer(1, SendChannel.ReliableOrdered, PacketType.PosDriftStatsReport, w =>
+                        {
+                            w.Write(item.Tick);
+                            w.Write(false);
+                            w.Write(0);
+                            w.Write(0);
+                            w.Write(0);
+                            w.Write(0);
+                            w.Write(0);
+                            w.Write(0);
+                            w.Write(0f);
+                            w.Write(0f);
+                            w.Write(false);
+                            w.Write("None");
+                            w.Write(0);
+                            w.Write(0);
+                            w.Write(0);
+                            w.Write(0);
+                            w.Write(0);
+                            w.Write(item.BaselineAckSeq);
+                        });
+                    }
+                    continue;
+                }
+
                 var game = DXGame.Current;
                 int nCells = DXWorldGrid.NCells;
                 float maxCoord = nCells > 1 ? nCells - 0.5f : 10000f;
@@ -5068,9 +6027,12 @@ namespace TABCoopMod.Sync
 
                 int appliedCount = 0;
                 int protectedSelfOwned = 0;
+                int favorFarKept = 0;
                 int targetAligned = 0;
                 HashSet<ulong> targetAlignedIds = null;
-                byte localPid = Transport.LocalPlayerId;
+                List<ZombieFavorKeepFarFix> favorKeepFarFixes = null;
+                PlayerDefenseCoarseGrid defenseGrid = null;
+                byte localPid = CommandInterceptor.LocalPlayerId;
                 if (item.ApplyPosCorrection && item.Deltas != null && game != null)
                 {
                     if (_lastEntityPosCorrectedTick.Count > 512)
@@ -5123,6 +6085,34 @@ namespace TABCoopMod.Sync
 
                         nx = Math.Max(0.5f, Math.Min(maxCoord, nx));
                         ny = Math.Max(0.5f, Math.Min(maxCoord, ny));
+
+                        // Player-favorable micro-snap: for small zombie nudges near any player unit/building,
+                        // keep the position farther from players and tell Host to converge to that safe spot.
+                        if (isZombie && dist <= MaxAsyncNudgeCells)
+                        {
+                            if (defenseGrid == null)
+                                defenseGrid = new PlayerDefenseCoarseGrid(game, nCells);
+                            PointF curPos = e.Position;
+                            if ((defenseGrid.HasDangerNear(curPos.X, curPos.Y) || defenseGrid.HasDangerNear(nx, ny))
+                                && defenseGrid.TryGetMinDistSqToPlayer(nx, ny, out float distSqH)
+                                && distSqH <= PlayerDefenseCoarseGrid.MaxSafeRadiusSq
+                                && defenseGrid.TryGetMinDistSqToPlayer(curPos.X, curPos.Y, out float distSqC)
+                                && distSqC > distSqH
+                                && (Math.Sqrt(distSqC) - Math.Sqrt(distSqH)) >= PlayerDefenseCoarseGrid.MinFarAdvantageCells
+                                && PlayerDefenseCoarseGrid.IsZombieFallbackCellWalkable(curPos.X, curPos.Y, nCells))
+                            {
+                                float safeX = LockstepClock.QuantizeCoord(Math.Max(0.5f, Math.Min(maxCoord, curPos.X)));
+                                float safeY = LockstepClock.QuantizeCoord(Math.Max(0.5f, Math.Min(maxCoord, curPos.Y)));
+                                _lastEntityPosCorrectedTick[e.ID] = item.Tick;
+                                if (favorKeepFarFixes == null)
+                                    favorKeepFarFixes = new List<ZombieFavorKeepFarFix>(16);
+                                if (favorKeepFarFixes.Count < 64)
+                                    favorKeepFarFixes.Add(new ZombieFavorKeepFarFix { Id = e.ID, X = safeX, Y = safeY });
+                                favorFarKept++;
+                                continue;
+                            }
+                        }
+
                         float actualDx = nx - e.Position.X;
                         float actualDy = ny - e.Position.Y;
                         var newPos = new PointF(nx, ny);
@@ -5220,18 +6210,20 @@ namespace TABCoopMod.Sync
                 }
 
                 double alignNow = DXHelper_Environment.Ticks;
-                bool notableAlign = killsApplied > 0 || lifeApplied > 0
+                bool notableAlign = killsApplied > 0 || lifeApplied > 0 || favorFarKept > 0
+                    || (item.FavorKillZombiesForHost != null && item.FavorKillZombiesForHost.Count > 0)
                     || item.MissingOnClient >= 5 || item.MissingOnHost >= 5
                     || item.MaxDelta >= 2.0f || item.ExceededThreshold
                     || ModLogger.IsVerbose;
                 if (notableAlign || targetAligned > 0 || alignNow < _lastAsyncPosAlignLogMs || (alignNow - _lastAsyncPosAlignLogMs) >= PosAlignLogIntervalMs)
                 {
                     _lastAsyncPosAlignLogMs = alignNow;
+                    int favorKillCount = item.FavorKillZombiesForHost != null ? item.FavorKillZombiesForHost.Count : 0;
                     ModLogger.Info(
-                        $"[AsyncPosAlign] Tick={item.Tick} Apply={item.ApplyCorrection}(pos={(item.ApplyPosCorrection ? 1 : 0)}:{appliedCount}/{item.ComparedCount}, selfProt={protectedSelfOwned}, tgt={targetAligned}) " +
+                        $"[AsyncPosAlign] Tick={item.Tick} Apply={item.ApplyCorrection}(pos={(item.ApplyPosCorrection ? 1 : 0)}:{appliedCount}/{item.ComparedCount}, selfProt={protectedSelfOwned}, favorFar={favorFarKept}, tgt={targetAligned}) " +
                         $"Drifted(>0.001={item.Drifted001}, >0.01={item.Drifted01}, >0.1={item.Drifted1}, >0.5={item.Drifted5}) " +
                         $"MaxDelta={item.MaxDelta:F4} Rms={item.RmsDelta:F4} MaxType={maxType} Exceeded={item.ExceededThreshold} " +
-                        $"LifeDiff={item.LifeDiffCount} LifeFix={lifeApplied} Kills={killsApplied} MissingOnHost={item.MissingOnHost} MissingOnClient={item.MissingOnClient}");
+                        $"LifeDiff={item.LifeDiffCount} LifeFix={lifeApplied} Kills={killsApplied} FavorKills={favorKillCount} MissingOnHost={item.MissingOnHost} MissingOnClient={item.MissingOnClient}");
                 }
 
                 Transport.SendToPeer(1, SendChannel.ReliableOrdered, PacketType.PosDriftStatsReport, w =>
@@ -5253,7 +6245,102 @@ namespace TABCoopMod.Sync
                     w.Write(killsApplied);
                     w.Write(item.MissingOnHost);
                     w.Write(item.MissingOnClient);
+                    w.Write(item.BaselineAckSeq);
+                    ushort fkCount = (ushort)(item.FavorKillZombiesForHost != null ? Math.Min(32, item.FavorKillZombiesForHost.Count) : 0);
+                    w.Write(fkCount);
+                    for (int fi = 0; fi < fkCount; fi++)
+                        w.Write(item.FavorKillZombiesForHost[fi]);
+                    ushort fpCount = (ushort)(favorKeepFarFixes != null ? Math.Min(64, favorKeepFarFixes.Count) : 0);
+                    w.Write(fpCount);
+                    for (int fi = 0; fi < fpCount; fi++)
+                    {
+                        var ff = favorKeepFarFixes[fi];
+                        w.Write(ff.Id);
+                        w.Write(ff.X);
+                        w.Write(ff.Y);
+                    }
                 });
+            }
+
+            PlayerDefenseCoarseGrid hostDefenseGrid = null;
+            while (_incomingZombieFavorAlignQueue.TryDequeue(out var favor))
+            {
+                if (favor.Generation != curGen || Transport == null || !Transport.IsHost) continue;
+                if (!EnableAsyncPosAlign) continue;
+                var game = DXGame.Current;
+                if (game == null) continue;
+
+                int curTick = game.IAIterationInt;
+                int nCells = DXWorldGrid.NCells;
+                float maxCoord = nCells > 1 ? nCells - 0.5f : 10000f;
+                int hostFavorKills = 0;
+                int hostFavorMoves = 0;
+
+                if (favor.KillZombieIds != null && favor.KillZombieIds.Count > 0)
+                {
+                    for (int i = 0; i < favor.KillZombieIds.Count; i++)
+                    {
+                        DXEntity e = game.GetEntityByID(favor.KillZombieIds[i]);
+                        if (e == null || e.Disposed || !GameBridge.IsZombieType(e.GetType())) continue;
+                        if (GameBridge.TryCorrectLife(e, 0, forceKill: true))
+                            hostFavorKills++;
+                    }
+                }
+
+                if (favor.KeepFarFixes != null && favor.KeepFarFixes.Count > 0)
+                {
+                    if (hostDefenseGrid == null)
+                        hostDefenseGrid = new PlayerDefenseCoarseGrid(game, nCells);
+                    for (int i = 0; i < favor.KeepFarFixes.Count; i++)
+                    {
+                        var ff = favor.KeepFarFixes[i];
+                        if (_lastEntityPosCorrectedTick.TryGetValue(ff.Id, out int prevTick))
+                        {
+                            int elapsed = curTick - prevTick;
+                            if (elapsed >= 0 && elapsed < EntityPosRealignCooldownTicks)
+                                continue;
+                        }
+
+                        DXEntity e = game.GetEntityByID(ff.Id);
+                        if (e == null || e.Disposed || e.PhysicalType != DXBodyType.Dynamic) continue;
+                        if (!GameBridge.IsZombieType(e.GetType())) continue;
+
+                        float nx = LockstepClock.QuantizeCoord(Math.Max(0.5f, Math.Min(maxCoord, ff.X)));
+                        float ny = LockstepClock.QuantizeCoord(Math.Max(0.5f, Math.Min(maxCoord, ff.Y)));
+                        if (!PlayerDefenseCoarseGrid.IsZombieFallbackCellWalkable(nx, ny, nCells))
+                            continue;
+
+                        float dx = nx - e.Position.X;
+                        float dy = ny - e.Position.Y;
+                        float dist = (float)Math.Sqrt(dx * dx + dy * dy);
+                        if (dist < MinAsyncPosSnapCells || dist > MaxAsyncNudgeCells)
+                            continue;
+
+                        if (hostDefenseGrid.TryGetMinDistSqToPlayer(e.Position.X, e.Position.Y, out float curDistSq)
+                            && (!hostDefenseGrid.TryGetMinDistSqToPlayer(nx, ny, out float targetDistSq) || targetDistSq > curDistSq))
+                        {
+                            float actualDx = nx - e.Position.X;
+                            float actualDy = ny - e.Position.Y;
+                            var newPos = new PointF(nx, ny);
+                            e.LastPosition = newPos;
+                            e.Position = newPos;
+                            var body = e.Body;
+                            if (body != null && body.Handle != IntPtr.Zero)
+                            {
+                                body.LastPositionComputed = newPos;
+                                body.PositionComputed = newPos;
+                                body.PhysicPosition = newPos;
+                            }
+                            _lastEntityPosCorrectedTick[e.ID] = curTick;
+                            if (dist <= 3.5f)
+                                RenderVisualInterpolationPatch.RecordVisualSnapOffset(e.ID, -actualDx, -actualDy);
+                            hostFavorMoves++;
+                        }
+                    }
+                }
+
+                if (hostFavorKills > 0 || hostFavorMoves > 0)
+                    ModLogger.Info($"[ZombieFavorAlign] Applied from P{favor.SenderPlayerId} Tick={favor.Tick}: favorKills={hostFavorKills}, favorFar={hostFavorMoves}");
             }
 
             while (_incomingReverseAlignQueue.TryDequeue(out var rev))
@@ -5878,16 +6965,15 @@ namespace TABCoopMod.Sync
                 offset += p.Length;
             }
 
-            if (!_tickPosCache.TryGetValue(buf.SimTick, out var clientSamples) || clientSamples == null)
-            {
-                ModLogger.Warn($"[AsyncPosAlign] No cached client positions for Tick {buf.SimTick}; cannot measure/apply delta.");
-                return;
-            }
+            bool hasClientPos = _tickPosCache.TryGetValue(buf.SimTick, out var clientSamples) && clientSamples != null;
+            if (!hasClientPos)
+                ModLogger.Warn($"[AsyncPosAlign] No cached client positions for Tick {buf.SimTick}; updating baseline only.");
 
-            var clientSnapshot = clientSamples.ToArray();
-            bool hasClientEcon = _tickEconCache.TryGetValue(buf.SimTick, out EconSnapshot clientEcon);
+            var clientSnapshot = hasClientPos ? clientSamples.ToArray() : Array.Empty<StateHasher.EntityPosSample>();
+            EconSnapshot clientEcon = default;
+            bool hasClientEcon = hasClientPos && _tickEconCache.TryGetValue(buf.SimTick, out clientEcon);
             StateHasher.ProdQueueSample[] clientProdSnap =
-                _tickProdCache.TryGetValue(buf.SimTick, out var clientProdList) && clientProdList != null
+                hasClientPos && _tickProdCache.TryGetValue(buf.SimTick, out var clientProdList) && clientProdList != null
                     ? clientProdList.ToArray()
                     : Array.Empty<StateHasher.ProdQueueSample>();
             int gen = _asyncGeneration;
@@ -5900,10 +6986,6 @@ namespace TABCoopMod.Sync
                 {
                     if (gen != _asyncGeneration) return;
 
-                    var clientMap = new Dictionary<ulong, StateHasher.EntityPosSample>(clientSnapshot.Length);
-                    for (int i = 0; i < clientSnapshot.Length; i++)
-                        clientMap[clientSnapshot[i].Id] = clientSnapshot[i];
-
                     int count;
                     ushort hostMask;
                     bool flagApplyLife;
@@ -5914,6 +6996,9 @@ namespace TABCoopMod.Sync
                     bool flagHasStructMeta;
                     bool flagHasTargetMeta;
                     bool flagHasSpawnMeta;
+                    int decodedChunkSeq = 0;
+                    int baselineSeqUsed = 0;
+                    int missingBaselineCount = 0;
                     List<StateHasher.EntityPosSample> hostSamples;
                     EconSnapshot hostEcon = default;
                     List<StateHasher.ProdQueueSample> hostProds = null;
@@ -5941,6 +7026,8 @@ namespace TABCoopMod.Sync
                             flagHasSpawnMeta = (flags & 128) != 0;
                             int chunkSeq = br.ReadInt32();
                             int baselineSeq = br.ReadInt32();
+                            decodedChunkSeq = chunkSeq;
+                            baselineSeqUsed = baselineSeq;
                             count = (int)NetCommand.ReadVarUInt32(br);
 
                             Dictionary<ulong, StateHasher.EntityPosSample> prevBase = null;
@@ -5948,8 +7035,11 @@ namespace TABCoopMod.Sync
                             {
                                 lock (_driftBaselineLock)
                                 {
-                                    if (_clientPrevDriftSeq == baselineSeq && _clientPrevDriftSamples != null)
+                                    if (!_clientDriftBaselinesBySeq.TryGetValue(baselineSeq, out prevBase)
+                                        && _clientPrevDriftSeq == baselineSeq && _clientPrevDriftSamples != null)
+                                    {
                                         prevBase = _clientPrevDriftSamples;
+                                    }
                                 }
                             }
 
@@ -5971,7 +7061,11 @@ namespace TABCoopMod.Sync
                                     if (prevBase != null && prevBase.TryGetValue(id, out var bs))
                                         sample = bs;
                                     else
-                                        sample = new StateHasher.EntityPosSample { Id = id };
+                                    {
+                                        // Never fabricate a zero (X=0, Y=0, Life=0) sample when baseline history is missing.
+                                        missingBaselineCount++;
+                                        continue;
+                                    }
                                 }
                                 else
                                 {
@@ -6030,8 +7124,27 @@ namespace TABCoopMod.Sync
 
                             lock (_driftBaselineLock)
                             {
-                                _clientPrevDriftSeq = chunkSeq;
-                                _clientPrevDriftSamples = nextBase;
+                                if (missingBaselineCount == 0 && chunkSeq > 0)
+                                {
+                                    _clientPrevDriftSeq = chunkSeq;
+                                    _clientPrevDriftSamples = nextBase;
+                                    if (!_clientDriftBaselinesBySeq.ContainsKey(chunkSeq))
+                                        _clientDriftBaselineOrder.Enqueue(chunkSeq);
+                                    _clientDriftBaselinesBySeq[chunkSeq] = nextBase;
+                                    while (_clientDriftBaselineOrder.Count > ClientDriftBaselineHistoryLimit)
+                                    {
+                                        int evictSeq = _clientDriftBaselineOrder.Dequeue();
+                                        if (evictSeq != chunkSeq)
+                                            _clientDriftBaselinesBySeq.Remove(evictSeq);
+                                    }
+                                }
+                                else if (missingBaselineCount > 0)
+                                {
+                                    _clientPrevDriftSeq = 0;
+                                    _clientPrevDriftSamples = null;
+                                    _clientDriftBaselinesBySeq.Clear();
+                                    _clientDriftBaselineOrder.Clear();
+                                }
                             }
 
                             if (flagHasEcon)
@@ -6230,6 +7343,52 @@ namespace TABCoopMod.Sync
 
                     if (gen != _asyncGeneration) return;
 
+                    if (missingBaselineCount > 0)
+                    {
+                        ModLogger.Warn($"[AsyncPosAlign] Missing baseline seq={baselineSeqUsed} at Tick {simTick} (missing={missingBaselineCount}/{count}); requesting full baseline.");
+                        _incomingPosAlignQueue.Enqueue(new PendingPosAlignApply
+                        {
+                            Generation = gen,
+                            Tick = simTick,
+                            BaselineAckSeq = -1,
+                            SkipApplyBaselineOnly = true
+                        });
+                        return;
+                    }
+
+                    if (!hasClientPos)
+                    {
+                        _incomingPosAlignQueue.Enqueue(new PendingPosAlignApply
+                        {
+                            Generation = gen,
+                            Tick = simTick,
+                            BaselineAckSeq = decodedChunkSeq,
+                            SkipApplyBaselineOnly = true
+                        });
+                        return;
+                    }
+
+                    var clientMap = new Dictionary<ulong, StateHasher.EntityPosSample>(clientSnapshot.Length);
+                    for (int i = 0; i < clientSnapshot.Length; i++)
+                        clientMap[clientSnapshot[i].Id] = clientSnapshot[i];
+
+                    HashSet<ulong> prevAliveZombies = null;
+                    lock (_clientEpochZombieLock)
+                    {
+                        if (simTick > _clientLastEpochZombieTick)
+                        {
+                            if (_clientLastEpochAliveZombies.Count > 0)
+                                prevAliveZombies = new HashSet<ulong>(_clientLastEpochAliveZombies);
+                            _clientLastEpochAliveZombies.Clear();
+                            for (int zi = 0; zi < clientSnapshot.Length; zi++)
+                            {
+                                if (clientSnapshot[zi].IsZombie && clientSnapshot[zi].Life > 0)
+                                    _clientLastEpochAliveZombies.Add(clientSnapshot[zi].Id);
+                            }
+                            _clientLastEpochZombieTick = simTick;
+                        }
+                    }
+
                     bool effectiveApplyLife = apply && flagApplyLife;
                     int comparedCount = 0;
                     int drifted001 = 0, drifted01 = 0, drifted1 = 0, drifted5 = 0;
@@ -6241,6 +7400,8 @@ namespace TABCoopMod.Sync
                     List<EntityDeltaFix> deltas = apply ? new List<EntityDeltaFix>(64) : null;
                     HashSet<ulong> driftedPosIds15 = (apply && flagHasTargetMeta) ? new HashSet<ulong>() : null;
                     List<EntityLifeFix> lifeFixes = effectiveApplyLife ? new List<EntityLifeFix>(64) : null;
+                    List<ulong> favorKillZombiesForHost = null;
+                    HashSet<ulong> favorLocallyDeadZombieIds = null;
                     var hostIds = new HashSet<ulong>();
                     var hostSampleMap = (flagHasSpawnMeta || flagHasStructMeta)
                         ? new Dictionary<ulong, StateHasher.EntityPosSample>(hostSamples.Count)
@@ -6261,6 +7422,19 @@ namespace TABCoopMod.Sync
                         if (hs.Id > hostMaxId) hostMaxId = hs.Id;
                         if (!clientMap.TryGetValue(hs.Id, out StateHasher.EntityPosSample cs))
                         {
+                            bool isTeamCollision = hostSpawnTeamMap != null
+                                && hostSpawnTeamMap.TryGetValue(hs.Id, out byte ht)
+                                && ht == 0;
+                            // Zombie alive on Client in previous epoch and now gone locally => killed by players on Client.
+                            // Keep it dead locally and forward to Host rather than respawning it via DynamicSpawns.
+                            if (effectiveApplyLife && !isTeamCollision && hs.Life > 0
+                                && prevAliveZombies != null && prevAliveZombies.Contains(hs.Id)
+                                && (favorKillZombiesForHost == null || favorKillZombiesForHost.Count < 32))
+                            {
+                                (favorKillZombiesForHost ?? (favorKillZombiesForHost = new List<ulong>(8))).Add(hs.Id);
+                                (favorLocallyDeadZombieIds ?? (favorLocallyDeadZombieIds = new HashSet<ulong>())).Add(hs.Id);
+                                continue;
+                            }
                             missingOnClient++;
                             continue;
                         }
@@ -6275,13 +7449,23 @@ namespace TABCoopMod.Sync
                             expTeamFilter = hIsPlayer ? (byte)1 : (byte)2;
                         }
 
-                        // Host-authoritative HP: apply the delta measured at the same epoch tick so
-                        // damage taken locally since then is preserved.
+                        // Host-authoritative HP, except Zombie death/alive divergence favors Death on both peers.
                         if (hs.Life != cs.Life)
                         {
                             lifeDiffCount++;
                             if (effectiveApplyLife)
-                                lifeFixes.Add(new EntityLifeFix { Id = hs.Id, Delta = hs.Life - cs.Life, Kill = hs.Life <= 0, ExpectedTeamFilter = expTeamFilter });
+                            {
+                                if (cs.IsZombie && cs.Life <= 0 && hs.Life > 0
+                                    && (favorKillZombiesForHost == null || favorKillZombiesForHost.Count < 32))
+                                {
+                                    (favorKillZombiesForHost ?? (favorKillZombiesForHost = new List<ulong>(8))).Add(hs.Id);
+                                    (favorLocallyDeadZombieIds ?? (favorLocallyDeadZombieIds = new HashSet<ulong>())).Add(hs.Id);
+                                }
+                                else
+                                {
+                                    lifeFixes.Add(new EntityLifeFix { Id = hs.Id, Delta = hs.Life - cs.Life, Kill = hs.Life <= 0, ExpectedTeamFilter = expTeamFilter });
+                                }
+                            }
                         }
 
                         if (!cs.IsDynamic) continue;
@@ -6491,6 +7675,7 @@ namespace TABCoopMod.Sync
                         {
                             var dsm = hostSpawnMetas[i];
                             if (clientMap.ContainsKey(dsm.Id)) continue;
+                            if (favorLocallyDeadZombieIds != null && favorLocallyDeadZombieIds.Contains(dsm.Id)) continue;
                             if (!hostSampleMap.TryGetValue(dsm.Id, out var hs)) continue;
                             pendingSpawns.Add(new DynamicSpawnSample
                             {
@@ -6515,6 +7700,8 @@ namespace TABCoopMod.Sync
                     bool exceededThreshold = maxDelta >= MaxAsyncTeleportCells;
                     bool emergencyPosOverride = maxDelta >= 3.5f || rmsDelta >= 1.2f;
                     bool effectiveApplyPos = apply && (flagApplyPos || emergencyPosOverride);
+                    if (exceededThreshold || missingOnClient > 16 || !effectiveApplyLife)
+                        favorKillZombiesForHost = null;
 
                     if (gen != _asyncGeneration) return;
 
@@ -6559,7 +7746,10 @@ namespace TABCoopMod.Sync
                         StructDestroys = structDestroys,
                         TargetFixes = (apply && flagHasTargetMeta) ? hostTargetMetas : null,
                         DriftedPosIds15 = driftedPosIds15,
-                        DynamicSpawns = dynamicSpawns
+                        DynamicSpawns = dynamicSpawns,
+                        FavorKillZombiesForHost = favorKillZombiesForHost,
+                        BaselineAckSeq = decodedChunkSeq,
+                        SkipApplyBaselineOnly = false
                     });
                 }
                 catch (Exception ex)
@@ -6613,6 +7803,33 @@ namespace TABCoopMod.Sync
             }
         }
 
+        private static void PumpClientSnapshotMissingCheck()
+        {
+            if (Transport == null || Transport.IsHost || !IsSessionActive) return;
+            if (_expectedChunks <= 0 || _incomingChunks.Count >= _expectedChunks) return;
+            double now = DXHelper_Environment.Ticks;
+            if (_lastSnapshotRxTicks <= 0.0 || now - _lastSnapshotRxTicks < 4000.0) return;
+            if (_lastSnapshotChunkRequestTicks > 0.0 && now - _lastSnapshotChunkRequestTicks < 4000.0) return;
+
+            _lastSnapshotChunkRequestTicks = now;
+            var missing = new List<int>(64);
+            for (int i = 0; i < _expectedChunks && missing.Count < 64; i++)
+            {
+                if (!_incomingChunks.ContainsKey(i))
+                    missing.Add(i);
+            }
+            if (missing.Count == 0) return;
+
+            ModLogger.Warn($"[CoopSessionManager] Snapshot stalled ({_incomingChunks.Count}/{_expectedChunks}); requesting {missing.Count} missing chunk(s) from Host...");
+            Transport.SendToPeer(1, SendChannel.ReliableCommand, PacketType.SnapshotChunkRequest, w =>
+            {
+                w.Write(false);
+                w.Write((ushort)missing.Count);
+                for (int i = 0; i < missing.Count; i++)
+                    w.Write(missing[i]);
+            });
+        }
+
         private static void TryAssembleSnapshot()
         {
             if (_expectedChunks <= 0 || _incomingChunks.Count < _expectedChunks) return;
@@ -6632,6 +7849,8 @@ namespace TABCoopMod.Sync
             }
             _incomingChunks.Clear();
             _expectedChunks = 0;
+            _lastSnapshotRxTicks = -1.0;
+            _lastSnapshotChunkRequestTicks = -1.0;
 
             ApplyReceivedSnapshotOnClient(savBytes, _incomingCheckContent, _incomingRandomSeed, _incomingEntityIdCounter);
         }
@@ -6700,7 +7919,7 @@ namespace TABCoopMod.Sync
 
         private static void WriteSnapshotFileSharedSafe(string path, byte[] data)
         {
-            const int maxAttempts = 30;
+            const int maxAttempts = 120;
             for (int attempt = 0; attempt < maxAttempts; attempt++)
             {
                 if (SnapshotFileMatches(path, data))
@@ -6733,6 +7952,7 @@ namespace TABCoopMod.Sync
         {
             try
             {
+                UI.CoopLobbyWindow.ClearStaleWindowOnLevelEnter();
                 CaptureLocalControlGroupsForMidGameReload();
                 if (_pendingResyncSelectionGroups == null)
                 {

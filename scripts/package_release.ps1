@@ -4,7 +4,7 @@
 
 param(
     [string]$WorkspaceDir = "",
-    [string]$Version = "v0.2.12"
+    [string]$Version = "v0.2.14"
 )
 
 $ErrorActionPreference = "Stop"
@@ -38,7 +38,7 @@ Copy-Item (Join-Path $binDir "0Harmony.dll") (Join-Path $stageDir "0Harmony.dll"
 
 [System.IO.File]::WriteAllText((Join-Path $stageDir "steam_appid.txt"), "644930")
 
-$asmVersion = "0.2.12.0"
+$asmVersion = "0.2.14.0"
 if ($Version -match '(\d+)\.(\d+)\.(\d+)') {
     $asmVersion = "$($Matches[1]).$($Matches[2]).$($Matches[3]).0"
 }

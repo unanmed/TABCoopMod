@@ -102,15 +102,16 @@ namespace TABCoopMod.UI
         private static void EnsureDefaultRecipient()
         {
             byte me = CommandInterceptor.LocalPlayerId;
-            int maxP = Math.Max(2, Math.Min(3, (int)FactionOwnershipTracker.ActivePlayerCount));
-            if (SelectedRecipientPlayer >= 1 && SelectedRecipientPlayer <= maxP
-                && SelectedRecipientPlayer != me && !FactionOwnershipTracker.IsExiled(SelectedRecipientPlayer))
+            if (SelectedRecipientPlayer >= 1 && SelectedRecipientPlayer <= 3
+                && SelectedRecipientPlayer != me
+                && FactionOwnershipTracker.IsSlotParticipating(SelectedRecipientPlayer)
+                && !FactionOwnershipTracker.IsExiled(SelectedRecipientPlayer))
             {
                 return;
             }
-            for (byte p = 1; p <= maxP; p++)
+            for (byte p = 1; p <= 3; p++)
             {
-                if (p != me && !FactionOwnershipTracker.IsExiled(p))
+                if (p != me && FactionOwnershipTracker.IsSlotParticipating(p) && !FactionOwnershipTracker.IsExiled(p))
                 {
                     SelectedRecipientPlayer = p;
                     return;
@@ -210,13 +211,12 @@ namespace TABCoopMod.UI
                 BorderDim, BgRow);
 
             EnsureDefaultRecipient();
-            int maxP = Math.Max(2, Math.Min(3, (int)FactionOwnershipTracker.ActivePlayerCount));
             for (int i = 0; i < 3; i++)
             {
                 byte pid = (byte)(i + 1);
                 var btn = _recipientButtons[i];
                 if (btn == null) continue;
-                bool show = IsOpen && ActiveTab == 0 && pid <= maxP && pid != localPid;
+                bool show = IsOpen && ActiveTab == 0 && FactionOwnershipTracker.IsSlotParticipating(pid) && pid != localPid;
                 btn.Visible = show;
                 if (!show) continue;
                 bool exiled = FactionOwnershipTracker.IsExiled(pid);
