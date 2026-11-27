@@ -1081,6 +1081,7 @@ namespace TABCoopMod.Sync
                 ? (INetworkTransport)CreateLanTransport(host: false, port: 0)
                 : CreateTransport(useLoopback);
             BindTransportEvents();
+            ModLogger.Info($"[LAN DEBUG] JoinSession target='{targetAddressOrSteamId}' lanMode={lanMode} useLoopback={useLoopback}; connecting...");
             Transport.ConnectToHost(targetAddressOrSteamId);
 
             RoomPhase = LobbyRoomPhase.InLobby;

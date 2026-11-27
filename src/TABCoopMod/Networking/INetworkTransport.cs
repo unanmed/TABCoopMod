@@ -272,6 +272,7 @@ namespace TABCoopMod.Networking
             JoinAddress = host;
             JoinPort = port;
             ConnectedRemoteAddress = string.Empty;
+            ModLogger.Info($"[LAN DEBUG] ConnectToHost target='{targetAddressOrSteamId}' parsed host='{host}' port={port} lanMode={IsLanMode}");
 
             int timeoutMs = 8000;
             if (int.TryParse(Environment.GetEnvironmentVariable("TABCOOP_LAN_CONNECT_TIMEOUT_MS"), out int envTimeout) && envTimeout > 0)
@@ -509,15 +510,64 @@ namespace TABCoopMod.Networking
         private static TcpClient ConnectTcpFastest(string host, int port, int timeoutMs, out string connectedAddress)
         {
             connectedAddress = string.Empty;
-            IPAddress[] addresses;
-            try
+            var resolved = new List<string>();
+            var errors = new List<string>();
+            IPAddress[] addresses = null;
+
+            // An IP literal must not depend on the process DNS resolver at all.
+            if (IPAddress.TryParse(host, out var literal))
             {
-                addresses = Dns.GetHostAddresses(host);
+                addresses = new[] { literal };
+                ModLogger.Info($"[LAN DEBUG] '{host}' is an IP literal; bypassing DNS.");
             }
-            catch (Exception ex)
+            else
             {
-                throw new InvalidOperationException($"解析 {host} 失败。", ex);
+                try
+                {
+                    addresses = Dns.GetHostAddresses(host);
+                }
+                catch (Exception ex)
+                {
+                    errors.Add($"Dns.GetHostAddresses: {ex.GetType().Name}: {ex.Message}");
+                    ModLogger.Warn($"[LAN DEBUG] Dns.GetHostAddresses('{host}') failed: {ex}");
+                    try
+                    {
+                        addresses = Dns.GetHostEntry(host).AddressList;
+                        ModLogger.Info($"[LAN DEBUG] Dns.GetHostEntry('{host}') fallback returned {addresses?.Length ?? 0} address(es).");
+                    }
+                    catch (Exception fallbackEx)
+                    {
+                        errors.Add($"Dns.GetHostEntry: {fallbackEx.GetType().Name}: {fallbackEx.Message}");
+                        ModLogger.Warn($"[LAN DEBUG] Dns.GetHostEntry('{host}') fallback failed: {fallbackEx}");
+                        addresses = null;
+                    }
+                }
+
+                if ((addresses == null || addresses.Length == 0))
+                {
+                    try
+                    {
+                        addresses = Dns.GetHostEntry(host).AddressList;
+                        ModLogger.Info($"[LAN DEBUG] Dns.GetHostAddresses was empty; Dns.GetHostEntry fallback returned {addresses?.Length ?? 0} address(es).");
+                    }
+                    catch (Exception fallbackEx)
+                    {
+                        errors.Add($"Dns.GetHostEntry(empty fallback): {fallbackEx.GetType().Name}: {fallbackEx.Message}");
+                        ModLogger.Warn($"[LAN DEBUG] Dns.GetHostEntry('{host}') empty fallback failed: {fallbackEx}");
+                    }
+                }
             }
+
+            if (addresses != null)
+            {
+                foreach (var address in addresses)
+                {
+                    if (address == null) continue;
+                    resolved.Add($"{address.AddressFamily}:{address}");
+                }
+            }
+
+            ModLogger.Info($"[LAN DEBUG] Resolve '{host}' -> {resolved.Count} address(es): [{string.Join(", ", resolved)}]");
 
             var pending = new List<(TcpClient Client, IAsyncResult Result, IPAddress Address)>();
             if (addresses != null)
@@ -532,15 +582,22 @@ namespace TABCoopMod.Networking
                         var result = client.BeginConnect(address, port, null, null);
                         pending.Add((client, result, address));
                     }
-                    catch
+                    catch (Exception ex)
                     {
+                        string err = $"{address}: BeginConnect {ex.GetType().Name}: {ex.Message}";
+                        errors.Add(err);
+                        ModLogger.Warn($"[LAN DEBUG] {err}");
                         try { client?.Close(); } catch { }
                     }
                 }
             }
 
             if (pending.Count == 0)
-                throw new TimeoutException($"连接 {host}:{port} 失败：没有可用地址。");
+            {
+                string detail = errors.Count > 0 ? string.Join(" | ", errors) : "no address could start a connection";
+                ModLogger.Warn($"[LAN DEBUG] Connect {host}:{port} has no usable address. resolved=[{string.Join(", ", resolved)}] errors=[{detail}]");
+                throw new TimeoutException($"连接 {host}:{port} 失败：没有可用地址。resolved=[{string.Join(", ", resolved)}] errors=[{detail}]");
+            }
 
             var started = System.Diagnostics.Stopwatch.StartNew();
             TcpClient winner = null;
@@ -557,8 +614,10 @@ namespace TABCoopMod.Networking
                 {
                     index = WaitHandle.WaitAny(handles, remaining);
                 }
-                catch
+                catch (Exception ex)
                 {
+                    errors.Add($"WaitAny: {ex.GetType().Name}: {ex.Message}");
+                    ModLogger.Warn($"[LAN DEBUG] WaitAny failed: {ex}");
                     break;
                 }
                 if (index == WaitHandle.WaitTimeout) break;
@@ -572,8 +631,11 @@ namespace TABCoopMod.Networking
                     connectedAddress = entry.Address.ToString();
                     break;
                 }
-                catch
+                catch (Exception ex)
                 {
+                    string err = $"{entry.Address}: EndConnect {ex.GetType().Name}: {ex.Message}";
+                    errors.Add(err);
+                    ModLogger.Warn($"[LAN DEBUG] {err}");
                     try { entry.Client.Close(); } catch { }
                 }
             }
@@ -584,7 +646,13 @@ namespace TABCoopMod.Networking
             }
 
             if (winner == null)
-                throw new TimeoutException($"连接 {host}:{port} 超时（{timeoutMs}ms）。");
+            {
+                string detail = errors.Count > 0 ? string.Join(" | ", errors) : "timeout with no error details";
+                ModLogger.Warn($"[LAN DEBUG] Connect {host}:{port} failed/timeout after {timeoutMs}ms. resolved=[{string.Join(", ", resolved)}] errors=[{detail}]");
+                throw new TimeoutException($"连接 {host}:{port} 超时（{timeoutMs}ms）。resolved=[{string.Join(", ", resolved)}] errors=[{detail}]");
+            }
+
+            ModLogger.Info($"[LAN DEBUG] Connected via {connectedAddress}:{port}; resolved=[{string.Join(", ", resolved)}]");
             return winner;
         }
 

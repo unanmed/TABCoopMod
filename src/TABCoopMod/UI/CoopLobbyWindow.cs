@@ -1568,6 +1568,7 @@ namespace TABCoopMod.UI
                     }
                     catch (Exception ex)
                     {
+                        ModLogger.Warn($"[LAN DEBUG] Join LAN failed target='{target}': {ex}");
                         _entryStatusMessage = $"连接局域网房主失败: {ex.Message}";
                         CoopSessionManager.StopSession();
                         RefreshUI();
@@ -1598,6 +1599,7 @@ namespace TABCoopMod.UI
             }
             catch (Exception ex)
             {
+                ModLogger.Warn($"[LAN DEBUG] Join last LAN failed target='{target}': {ex}");
                 _entryStatusMessage = $"连接上次房间失败: {ex.Message}";
                 CoopSessionManager.StopSession();
                 RefreshUI();
